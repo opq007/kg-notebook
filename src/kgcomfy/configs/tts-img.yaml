@@ -50,50 +50,11 @@ updates:
 # reclone: 先删除目录再重新 clone（用于替换不兼容的旧版本）
 # repo 留空表示只更新整包里已有的目录，不负责首次 clone
 custom_nodes:
-  - name: ComfyUI-VoxCPM
-    repo: https://github.com/opq007/ComfyUI-VoxCPM.git
-    enabled: true
-    install_requirements: true
-
   - name: ComfyUI-KJNodes
     enabled: true
 
   - name: ComfyUI-Easy-Use
     enabled: true
-
-  # 原笔记本里用于替换 GGUF 节点的操作；默认关闭，避免误删
-  - name: ComfyUI-GGUF
-    repo: https://github.com/leejet/ComfyUI-GGUF.git
-    enabled: false
-    reclone: true
-
-  # 下面这些在原笔记本中默认注释掉，需要时把 enabled 改成 true
-  - name: ComfyUI-LTX2.5-MSR
-    repo: https://github.com/liconstudio/ComfyUI-LTX2.5-MSR.git
-    enabled: false
-
-  - name: ComfyUI-MiniMaxH3-FP16Safe
-    repo: https://github.com/aaalll12322/ComfyUI-MiniMaxH3-FP16Safe.git
-    enabled: false
-
-  - name: ComfyUI_Nvidia_VFX_Nodes
-    repo: https://github.com/Comfy-Org/ComfyUI_Nvidia_VFX_Nodes.git
-    enabled: false
-    install_requirements: true
-
-  - name: Comfyui-HAIGC-QwenTTS
-    repo: https://github.com/HAIGC/Comfyui-HAIGC-QwenTTS.git
-    enabled: false
-    install_requirements: true
-
-  - name: ComfyUI_RH_VoxCPM
-    repo: https://github.com/HM-RunningHub/ComfyUI_RH_VoxCPM.git
-    enabled: false
-    install_requirements: true
-
-  - name: ComfyUI-Fisher-Pose
-    repo: https://github.com/Work-Fisher/ComfyUI-Fisher-Pose.git
-    enabled: false
 
 # 模型路径映射：src 为 Kaggle 输入（只读），dest 相对路径以 comfy_dir 为基准。
 # 也支持简写：
@@ -132,7 +93,7 @@ comfyui:
 frp:
   enabled: true
   # 可以是本地文件（Kaggle dataset 挂载路径）或 http(s) URL
-  binary: /kaggle/input/opq-utils/frpc
+  binary: /kaggle/input/datasets/opq007/opq-utils
   binary_dest: /kaggle/frpc/frpc
   config_path: /kaggle/frpc.toml
   server_addr: oracle2.120168.xyz
