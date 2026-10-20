@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kgcomfy"
+version = "0.1.0"
+description = "Reusable Kaggle bootstrap library for ComfyUI notebooks (runtime, models, frp, filebrowser)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = []
+
+[project.optional-dependencies]
+yaml = ["PyYAML>=6"]
+dev = ["pytest>=7", "PyYAML>=6"]
+
+[project.scripts]
+kgcomfy = "kgcomfy.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+kgcomfy = ["configs/*.yaml", "configs/*.yml"]

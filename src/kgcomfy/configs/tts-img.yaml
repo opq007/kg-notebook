@@ -1,0 +1,190 @@
+# kgcomfy 默认配置：tts-img 笔记本
+# 所有可能随笔记本/账号/Kaggle 会话变化的项都集中在这里。
+# 笔记本里可以用 load_config(..., overrides={...}) 做少量覆盖。
+
+log_level: INFO
+dry_run: false
+
+runtime:
+  comfy_dir: /kaggle/ComfyUI
+  python_dir: /py312
+  # 留空时自动使用 <python_dir>/bin/python3
+  # python_bin: /py312/bin/python3
+  install_bundles: true
+  apt_packages:
+    - aria2
+  aria2:
+    connections: 16
+    splits: 16
+
+  # ComfyUI 整包（包含 custom_nodes、models 目录结构）
+  comfyui_bundle:
+    url: https://modelscope.cn/datasets/opqtest007/comfy/resolve/master/ComfyUI.tar
+    archive: /kaggle/ComfyUI.tar
+    extract_to: /kaggle
+
+  # 便携 Python 运行时（torch/cuda 依赖都打包在里面）
+  python_bundle:
+    url: https://modelscope.cn/datasets/opqtest007/comfy/resolve/master/py312_cu130_torch212.tar?view=false
+    archive: /py312_cu130_torch212.tar
+    extract_to: /
+
+  # 在 /kaggle/working 下建立入口软链，方便从 output 目录访问
+  links:
+    - path: /kaggle/working/ComfyUI
+      target: /kaggle/ComfyUI
+    - path: /kaggle/working/py312
+      target: /py312
+
+updates:
+  # 是否 git pull ComfyUI 最新版
+  comfyui: false
+  # git pull 后是否重装 ComfyUI 依赖
+  comfyui_requirements: true
+  # 是否 git pull 所有 enabled 的自定义节点
+  custom_nodes: false
+  # 更新节点后是否重装其 requirements.txt
+  custom_node_requirements: false
+
+# enabled: 是否由本库管理（缺失时尝试 clone，更新开关打开时 git pull）
+# reclone: 先删除目录再重新 clone（用于替换不兼容的旧版本）
+# repo 留空表示只更新整包里已有的目录，不负责首次 clone
+custom_nodes:
+  - name: ComfyUI-VoxCPM
+    repo: https://github.com/opq007/ComfyUI-VoxCPM.git
+    enabled: true
+    install_requirements: true
+
+  - name: ComfyUI-KJNodes
+    enabled: true
+
+  - name: ComfyUI-Easy-Use
+    enabled: true
+
+  # 原笔记本里用于替换 GGUF 节点的操作；默认关闭，避免误删
+  - name: ComfyUI-GGUF
+    repo: https://github.com/leejet/ComfyUI-GGUF.git
+    enabled: false
+    reclone: true
+
+  # 下面这些在原笔记本中默认注释掉，需要时把 enabled 改成 true
+  - name: ComfyUI-LTX2.5-MSR
+    repo: https://github.com/liconstudio/ComfyUI-LTX2.5-MSR.git
+    enabled: false
+
+  - name: ComfyUI-MiniMaxH3-FP16Safe
+    repo: https://github.com/aaalll12322/ComfyUI-MiniMaxH3-FP16Safe.git
+    enabled: false
+
+  - name: ComfyUI_Nvidia_VFX_Nodes
+    repo: https://github.com/Comfy-Org/ComfyUI_Nvidia_VFX_Nodes.git
+    enabled: false
+    install_requirements: true
+
+  - name: Comfyui-HAIGC-QwenTTS
+    repo: https://github.com/HAIGC/Comfyui-HAIGC-QwenTTS.git
+    enabled: false
+    install_requirements: true
+
+  - name: ComfyUI_RH_VoxCPM
+    repo: https://github.com/HM-RunningHub/ComfyUI_RH_VoxCPM.git
+    enabled: false
+    install_requirements: true
+
+  - name: ComfyUI-Fisher-Pose
+    repo: https://github.com/Work-Fisher/ComfyUI-Fisher-Pose.git
+    enabled: false
+
+# 模型路径映射：src 为 Kaggle 输入（只读），dest 相对路径以 comfy_dir 为基准。
+# 也支持简写：
+# models:
+#   /kaggle/input/xxx/model.safetensors: models/clip/model.safetensors
+models:
+  - src: /kaggle/input/models/opq007/voxcpm2/gguf/main/1
+    dest: models/tts/VoxCPM/VoxCPM2
+
+  - src: /kaggle/input/models/opq007/qwen21/gguf/int8/1/qwen3vl_8b_w4a8.safetensors
+    dest: models/clip/qwen3vl_8b_w4a8.safetensors
+
+  - src: /kaggle/input/models/opq007/qwen21/gguf/int8/1/qwen_image_2.1_vae_bf16.safetensors
+    dest: models/vae/qwen_image_2.1_vae_bf16.safetensors
+
+  - src: /kaggle/input/models/opq007/qwen21/gguf/int8/1/qwen_image_2.1_int8_convrot.safetensors
+    dest: models/unet/qwen_image_2.1_int8_convrot.safetensors
+
+  - src: /kaggle/input/models/opq007/qwen21/gguf/int8/1/qwen_image_2.1_fun_controlnet_union_int8_convrot.safetensors
+    dest: models/model_patches/qwen_image_2.1_fun_controlnet_union_int8_convrot.safetensors
+
+  - src: /kaggle/input/models/opq007/qwen21/gguf/int8/1/qwen_image_2.1_turbo_lora_avg_rank_178_bf16.safetensors
+    dest: models/loras/qwen_image_2.1_turbo_lora_avg_rank_178_bf16.safetensors
+
+comfyui:
+  port: 8188
+  args:
+    - --disable-pinned-memory
+    - --force-fp16
+    - --port={port}
+  env:
+    CUDA_VISIBLE_DEVICES: "0,1"
+    MPLBACKEND: Agg
+  requirements_file: requirements.txt
+
+frp:
+  enabled: true
+  # 可以是本地文件（Kaggle dataset 挂载路径）或 http(s) URL
+  binary: /kaggle/input/opq-utils/frpc
+  binary_dest: /kaggle/frpc/frpc
+  config_path: /kaggle/frpc.toml
+  server_addr: oracle2.120168.xyz
+  server_port: 7780
+  token_secret: frp_token
+  subdomain: tts
+  public_scheme: http
+  # 留空时自动生成两个 proxy：
+  #   <subdomain>-comfyui-frp -> comfyui.port, locations ["/"]
+  #   <subdomain>-fslist-frp  -> filebrowser.port, locations ["/fslist"]
+  # proxies: []
+
+filebrowser:
+  enabled: true
+  binary_url: https://github.com/gtsteffaniak/filebrowser/releases/download/v1.3.0-stable/linux-amd64-filebrowser
+  binary_path: /kaggle/working/filebrowser
+  config_path: /kaggle/config.yaml
+  base_url: /fslist
+  port: 8012
+  sources:
+    - path: /kaggle
+      config:
+        defaultEnabled: true
+  admin_username: admin
+  # 密码从 Kaggle Secrets 读取，逻辑名对应下面的 secrets 配置
+  admin_password_secret: frp_token
+
+# 逻辑密钥名 -> Kaggle Secrets 名称 / 环境变量名
+# 代码中只引用逻辑名，避免把 token 写进 notebook
+secrets:
+  frp_token:
+    kaggle: frp_token
+    env: FRP_TOKEN
+  modelscope_token:
+    kaggle: modelscope_token
+    env: MODELSCOPE_TOKEN
+
+# 默认关闭；只允许操作 comfy_dir 下的路径
+cleanup:
+  enabled: false
+  paths:
+    - /kaggle/ComfyUI/models/voxcpm
+    - /kaggle/ComfyUI/models/qwen-tts/Qwen/Qwen3-TTS-Tokenizer-12Hz
+    - /kaggle/ComfyUI/models/qwen-tts/Qwen/Qwen3-TTS-12Hz-1.7B-Base
+    - /kaggle/ComfyUI/models/qwen-tts/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign
+  symlink_globs:
+    - /kaggle/ComfyUI/models/unet/*.safetensors
+    - /kaggle/ComfyUI/models/vae/*.safetensors
+    - /kaggle/ComfyUI/models/text_encoders/*.safetensors
+    - /kaggle/ComfyUI/models/loras/*.safetensors
+
+publish:
+  modelscope_repo: opqtest007/comfy
+  modelscope_token_secret: modelscope_token
+  repo_type: dataset
