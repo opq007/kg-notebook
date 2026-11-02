@@ -92,7 +92,8 @@ comfyui:
 
 frp:
   enabled: true
-  # 可以是本地文件（Kaggle dataset 挂载路径）或 http(s) URL
+  # 可以是本地文件（Kaggle dataset 挂载路径）或 http(s) URL。
+  # 指向目录时会自动在其中查找 frpc（最多 3 层），找到后复制成普通文件。
   binary: /kaggle/input/datasets/opq007/opq-utils
   binary_dest: /kaggle/frpc/frpc
   config_path: /kaggle/frpc.toml

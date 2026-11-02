@@ -163,7 +163,7 @@ models:
 | 字段 | 说明 |
 | --- | --- |
 | `enabled` | 是否启动 frpc |
-| `binary` | frpc 本地路径（Kaggle Dataset）或下载 URL |
+| `binary` | frpc 本地文件路径（Kaggle Dataset）或下载 URL；指向目录时自动在其中查找 `frpc`/`frpc.exe` |
 | `binary_dest` | 复制/下载后的路径 |
 | `config_path` | 生成的 `frpc.toml` 路径 |
 | `server_addr` / `server_port` | frp 服务端地址/端口 |

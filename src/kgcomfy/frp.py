@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 from pathlib import Path
-from typing import List
+from typing import Iterator, List
 
 from .config import ConfigError, FrpConfig, FrpProxyConfig
 from .secrets import SecretResolver
@@ -22,6 +23,49 @@ def _toml_string(value: str) -> str:
 
 def _toml_array(values: List[str]) -> str:
     return "[" + ", ".join(_toml_string(value) for value in values) + "]"
+
+
+_BINARY_NAMES = ("frpc", "frpc.exe")
+_BINARY_SEARCH_DEPTH = 3
+
+
+def _iter_files(root: Path, max_depth: int) -> Iterator[Path]:
+    root_depth = len(root.parts)
+    for dirpath, dirnames, filenames in os.walk(root):
+        current = Path(dirpath)
+        if len(current.parts) - root_depth >= max_depth:
+            dirnames[:] = []
+        for name in filenames:
+            yield current / name
+
+
+def resolve_binary_source(source: str | Path, dest: Path) -> Path:
+    """Return the file to install as frpc.
+
+    Kaggle datasets mount as directories, so ``frp.binary`` often points at a
+    folder that contains ``frpc``.  Picking the binary out of it matters:
+    copying the whole folder onto ``binary_dest`` creates a *directory* there,
+    and executing a directory fails with ``PermissionError: [Errno 13]``.
+    """
+    path = Path(source)
+    if not path.is_dir():
+        return path
+
+    wanted = {dest.name, *_BINARY_NAMES}
+    matches = [
+        item
+        for item in _iter_files(path, _BINARY_SEARCH_DEPTH)
+        if item.name in wanted
+    ]
+    if not matches:
+        raise ConfigError(
+            f"frp.binary={path} is a directory and no frpc executable was found "
+            f"in it (looked for {sorted(wanted)} within "
+            f"{_BINARY_SEARCH_DEPTH} levels); point frp.binary at the file itself"
+        )
+
+    matches.sort(key=lambda item: (len(item.parts), item.name != "frpc", str(item)))
+    return matches[0]
 
 
 def render_frp_config(
@@ -75,11 +119,15 @@ class FrpService:
         return self.config.effective_proxies(self.comfy_port, self.filebrowser_port)
 
     def install(self) -> None:
-        if not self.config.binary:
-            raise ConfigError("frp.binary is required when frp is enabled")
-
         dest = Path(self.config.binary_dest)
         source = self.config.binary
+
+        if not source:
+            if self.runner.dry_run or dest.is_file():
+                self.runner.chmod(dest, 0o755)
+                return
+            raise ConfigError("frp.binary is required when frp is enabled")
+
         if source.startswith(("http://", "https://")):
             self.runner.download(source, dest)
         else:
@@ -89,10 +137,29 @@ class FrpService:
                     f"frpc binary not found: {source_path}. Upload it as a Kaggle "
                     "dataset file or set frp.binary to a download URL."
                 )
-            if source_path.resolve() != dest.resolve():
-                self.runner.copy_path(source_path, dest, force=True)
+            binary_path = resolve_binary_source(source_path, dest)
+            if binary_path.resolve() != dest.resolve():
+                self.runner.copy_path(binary_path, dest, force=True)
 
         self.runner.chmod(dest, 0o755)
+        self._verify_installed(dest)
+
+    def _verify_installed(self, dest: Path) -> None:
+        if self.runner.dry_run:
+            return
+        if dest.is_dir():
+            raise ConfigError(
+                f"frp.binary_dest={dest} is a directory, not the frpc executable. "
+                "Point frp.binary at the frpc file, or at a directory that "
+                "contains it."
+            )
+        if not dest.is_file():
+            raise FileNotFoundError(f"frpc binary is missing after install: {dest}")
+        if os.name == "posix" and not os.access(dest, os.X_OK):
+            raise ConfigError(
+                f"frpc at {dest} is not executable (os.access X_OK failed); "
+                "check that the destination filesystem is not mounted noexec"
+            )
 
     def write_config(self) -> str:
         token = self.secrets.get(self.config.token_secret)
@@ -118,6 +185,14 @@ class FrpService:
         return self._thread
 
     def _run(self) -> None:
+        binary = Path(self.config.binary_dest)
+        if binary.is_dir():
+            log.error(
+                "frpc binary path %s is a directory; frp.binary must point at "
+                "the executable (or at a folder containing it)",
+                binary,
+            )
+            return
         try:
             self.runner.run(
                 [self.config.binary_dest, "-c", self.config.config_path],
