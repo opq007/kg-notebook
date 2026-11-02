@@ -47,9 +47,14 @@ class Aria2Config:
 
 @dataclass
 class BundleConfig:
+    #: Download URL (e.g. ModelScope); used when ``source`` is empty.
     url: str = ""
+    #: Local archive path (e.g. a Kaggle dataset file). Takes precedence.
+    source: str = ""
     archive: str = ""
     extract_to: str = ""
+    #: Stage the archive again even when it already exists.
+    overwrite: bool = False
 
 
 @dataclass

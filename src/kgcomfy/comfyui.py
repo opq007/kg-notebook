@@ -52,17 +52,15 @@ class ComfyUIInstaller:
         if expected_dir.exists():
             log.info("%s already present at %s; skipping", label, expected_dir)
             return
-        if not bundle.url or not bundle.archive:
+        if not bundle.archive:
+            raise ConfigError(f"{label} bundle archive path is not configured")
+        if not bundle.source and not bundle.url:
             raise ConfigError(
-                f"{label} is missing but its bundle URL/archive is not configured"
+                f"{label} is missing but neither its bundle source nor url is "
+                "configured"
             )
 
-        self.runner.download(
-            bundle.url,
-            bundle.archive,
-            connections=self.runtime.aria2.connections,
-            splits=self.runtime.aria2.splits,
-        )
+        self._stage_archive(label, bundle)
         self.runner.extract_tar(bundle.archive, bundle.extract_to)
 
         if not expected_dir.exists() and not self.runner.dry_run:
@@ -70,6 +68,46 @@ class ComfyUIInstaller:
                 f"{label} was extracted but {expected_dir} does not exist; "
                 "check the bundle archive layout"
             )
+
+    def _stage_archive(self, label: str, bundle: BundleConfig) -> None:
+        """Place the bundle archive at ``bundle.archive`` before extraction.
+
+        A bundle can come from a download URL or from a local file (typically
+        a Kaggle dataset input); ``source`` wins when both are set.
+        """
+        archive = Path(bundle.archive)
+        if bundle.source:
+            source = Path(bundle.source)
+            if not source.exists() and not self.runner.dry_run:
+                raise FileNotFoundError(
+                    f"{label} bundle archive not found: {source}. Add it to a "
+                    "Kaggle dataset and set bundle.source, or set bundle.url."
+                )
+            if source.exists() and source.is_dir():
+                raise ConfigError(
+                    f"{label} bundle source must be an archive file, got "
+                    f"directory: {source}"
+                )
+
+            ready = (
+                archive.exists()
+                and archive.stat().st_size > 0
+                and not bundle.overwrite
+            )
+            if ready:
+                log.info("Archive already present, skipping copy: %s", archive)
+                return
+            if source.resolve() != archive.resolve():
+                self.runner.copy_path(source, archive, force=True)
+            return
+
+        self.runner.download(
+            bundle.url,
+            archive,
+            connections=self.runtime.aria2.connections,
+            splits=self.runtime.aria2.splits,
+            overwrite=bundle.overwrite,
+        )
 
     def install_custom_nodes(self) -> None:
         """Clone configured nodes that are missing; install their requirements."""

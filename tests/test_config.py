@@ -36,6 +36,23 @@ class ConfigTests(unittest.TestCase):
         cfg = load_config({"runtime": {"python_dir": "/opt/py"}})
         self.assertEqual(cfg.runtime.python_bin, "/opt/py/bin/python3")
 
+    def test_bundle_source_override_keeps_url(self):
+        cfg = load_config(
+            "tts-img.yaml",
+            {
+                "runtime": {
+                    "comfyui_bundle": {
+                        "source": "/kaggle/input/ds/ComfyUI.tar.bak",
+                    }
+                }
+            },
+        )
+        self.assertEqual(
+            cfg.runtime.comfyui_bundle.source, "/kaggle/input/ds/ComfyUI.tar.bak"
+        )
+        self.assertTrue(cfg.runtime.comfyui_bundle.url.startswith("https://"))
+        self.assertFalse(cfg.runtime.comfyui_bundle.overwrite)
+
     def test_models_mapping_shorthand(self):
         cfg = load_config(
             {

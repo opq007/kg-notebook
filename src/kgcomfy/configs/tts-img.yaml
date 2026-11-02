@@ -18,16 +18,22 @@ runtime:
     splits: 16
 
   # ComfyUI 整包（包含 custom_nodes、models 目录结构）
+  # 来源二选一：url 从 ModelScope 下载；source 复制 Kaggle dataset 里的本地文件。
+  # 两者都写时优先 source；overwrite=true 时 archive 已存在也重新复制/下载。
   comfyui_bundle:
     url: https://modelscope.cn/datasets/opqtest007/comfy/resolve/master/ComfyUI.tar
+    # source: /kaggle/input/datasets/jdt00b/comfy/ComfyUI.tar.bak
     archive: /kaggle/ComfyUI.tar
     extract_to: /kaggle
+    overwrite: false
 
   # 便携 Python 运行时（torch/cuda 依赖都打包在里面）
   python_bundle:
     url: https://modelscope.cn/datasets/opqtest007/comfy/resolve/master/py312_cu130_torch212.tar?view=false
+    # source: /kaggle/input/datasets/jdt00b/comfy/py312_cu130_torch212.tar.bak
     archive: /py312_cu130_torch212.tar
     extract_to: /
+    overwrite: false
 
   # 在 /kaggle/working 下建立入口软链，方便从 output 目录访问
   links:

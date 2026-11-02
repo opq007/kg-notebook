@@ -100,8 +100,9 @@ print("\n".join(app.commands))
 | `install_bundles` | 是否下载/解压 ComfyUI 与 Python 整包 |
 | `apt_packages` | 需要 apt 安装的包，默认 `aria2` |
 | `aria2.connections` / `splits` | aria2 并发连接数/分片数 |
-| `comfyui_bundle.url` / `archive` / `extract_to` | ComfyUI 整包地址、落盘位置、解压目标 |
-| `python_bundle.url` / `archive` / `extract_to` | 便携 Python 整包 |
+| `comfyui_bundle.url` / `source` / `archive` / `extract_to` | ComfyUI 整包下载地址、本地压缩包（Kaggle Dataset，优先于 url）、落盘位置、解压目标 |
+| `python_bundle.url` / `source` / `archive` / `extract_to` | 便携 Python 整包，来源选择同上 |
+| `comfyui_bundle.overwrite` / `python_bundle.overwrite` | 为 `true` 时 archive 已存在也重新复制/下载，默认 `false` |
 | `links` | 需要额外创建的软链，如 `/kaggle/working/ComfyUI` |
 
 ### `updates`
@@ -232,7 +233,7 @@ pub.modelscope_upload("/kaggle/working/ComfyUI.tar", "ComfyUI.tar")
 | 原笔记本 | 新位置 |
 | --- | --- |
 | `!apt-get update` / `!apt install aria2` | `runtime.apt_packages` |
-| `aria2c` 下载 ComfyUI/Python 整包 | `runtime.comfyui_bundle` / `runtime.python_bundle` |
+| `aria2c` 下载 ComfyUI/Python 整包，或从 Kaggle Dataset 复制本地压缩包 | `runtime.comfyui_bundle` / `runtime.python_bundle` |
 | `tar -xf` + `ln -s` | `runtime.links` |
 | `git pull` ComfyUI | `updates.comfyui` |
 | `./updateNode.sh` / 节点 `git pull` | `updates.custom_nodes` |
