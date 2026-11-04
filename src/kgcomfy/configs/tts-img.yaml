@@ -131,10 +131,10 @@ watchdog:
 # 支持飞书、钉钉（含加签）、企业微信、Slack 和通用 JSON。
 # URL 里通常带 token，建议用环境变量 KGCOMFY_WEBHOOK_URL 或 Kaggle Secrets 注入。
 webhook:
-  enabled: false
+  enabled: true
   # auto 会按 URL 自动识别；也可显式指定 feishu / dingtalk / wecom / slack / generic
   provider: auto
-  url: ""
+  url: "https://open.feishu.cn/open-apis/bot/v2/hook/5c625efb-6fc8-4fd2-be9e-bccbb9e193e4"
   # 飞书/钉钉加签密钥（可选）
   secret: ""
   # 也可以从 Kaggle Secrets / 环境变量读取（逻辑名对应 secrets 配置或环境变量大写名）
