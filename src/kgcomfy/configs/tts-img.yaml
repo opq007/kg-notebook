@@ -96,6 +96,35 @@ comfyui:
     MPLBACKEND: Agg
   requirements_file: requirements.txt
 
+# ComfyUI 看门狗（Phase 1）：前台启动时监控进程与 /system_stats，
+# 异常退出或连续健康检查失败时按退避策略自动重启。
+# 重启后 ComfyUI 仍监听同一端口，frp 隧道不需要重建。
+watchdog:
+  enabled: true
+  # 健康检查路径；完整地址为 http://127.0.0.1:<comfyui.port><health_path>
+  health_path: /system_stats
+  # 轮询/健康检查间隔（秒）
+  interval: 20
+  # 单次 HTTP 健康检查超时（秒）
+  timeout: 5
+  # 启动宽限期结束后，连续失败多少次触发重启
+  failures: 3
+  # 启动宽限期（秒）：模型加载期间健康检查失败不计数
+  startup_grace: 300
+  # 重启退避：5s、10s、20s... 最多 300s
+  backoff_initial: 5
+  backoff_max: 300
+  # 时间窗口内的重启次数上限；超过后停止并写 failed 状态
+  max_restarts: 5
+  restart_window: 600
+  # SIGTERM 后等待多久再 SIGKILL（会终止整个进程组）
+  shutdown_timeout: 15
+  # ComfyUI stdout/stderr 与看门狗状态文件
+  log_path: /kaggle/working/comfyui.log
+  state_path: /kaggle/working/comfyui-watchdog.json
+  # 日志超过该大小后轮转为 .1（0 表示不轮转）
+  log_max_bytes: 52428800
+
 frp:
   enabled: true
   # 可以是本地文件（Kaggle dataset 挂载路径）或 http(s) URL。

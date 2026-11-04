@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import List
+from typing import Dict, List
 
 from .config import BundleConfig, Config, ConfigError, CustomNodeConfig
 from .shell import Runner
@@ -228,21 +228,33 @@ class ComfyUIInstaller:
             log.info("No custom nodes were updated")
 
     # --------------------------------------------------------------- execution
-    def run_comfyui(self) -> None:
+    def require_installed(self) -> None:
         if not self.comfy_dir.exists() and not self.runner.dry_run:
             raise FileNotFoundError(
                 f"ComfyUI directory not found: {self.comfy_dir}; run install first"
             )
 
+    def build_command(self) -> List[str]:
+        """Return the argv used to start ComfyUI."""
         args = [self.runtime.python_bin, "main.py"]
         for configured in self.config.comfyui.args:
             args.append(configured.replace("{port}", str(self.config.comfyui.port)))
-        if not any(arg.startswith("--port") for arg in args):
+        if not self.config.comfyui.has_port_argument():
             args.append(f"--port={self.config.comfyui.port}")
+        return args
 
+    def build_env(self) -> Dict[str, str]:
+        """Return the ComfyUI-specific environment overrides as strings."""
+        return {
+            str(key): str(value)
+            for key, value in self.config.comfyui.env.items()
+        }
+
+    def run_comfyui(self) -> None:
+        self.require_installed()
         self.runner.run(
-            args,
+            self.build_command(),
             cwd=self.comfy_dir,
-            env=self.config.comfyui.env,
+            env=self.build_env(),
             desc="Starting ComfyUI",
         )

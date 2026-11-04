@@ -2,8 +2,9 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from kgcomfy.shell import Runner, SafetyError
+from kgcomfy.shell import Runner, SafetyError, merge_env
 
 
 def symlinks_supported() -> bool:
@@ -18,6 +19,12 @@ def symlinks_supported() -> bool:
 
 
 class RunnerDryRunTests(unittest.TestCase):
+    def test_merge_env_overrides_and_stringifies(self):
+        with mock.patch.dict(os.environ, {"KG_TEST_ENV": "base"}, clear=False):
+            merged = merge_env({"KG_TEST_ENV": "override", "KG_TEST_NUM": 3})
+        self.assertEqual(merged["KG_TEST_ENV"], "override")
+        self.assertEqual(merged["KG_TEST_NUM"], "3")
+
     def test_run_records_history_without_executing(self):
         runner = Runner(dry_run=True)
         result = runner.run(["echo", "hello"])

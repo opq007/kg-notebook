@@ -15,8 +15,19 @@ from .models import Cleaner, ModelLinker, describe_models
 from .publish import Publisher
 from .secrets import SecretResolver
 from .shell import Runner
+from .supervisor import (
+    EXIT_CLEAN,
+    HttpHealthProbe,
+    SubprocessSpawner,
+    Supervisor,
+    SupervisorStatus,
+)
 
 log = logging.getLogger("kgcomfy")
+
+
+def _local_url(port: int) -> str:
+    return f"http://127.0.0.1:{port}"
 
 
 class KaggleComfy:
@@ -62,6 +73,7 @@ class KaggleComfy:
             ),
         )
         self._threads: List = []
+        self._supervisor: Supervisor | None = None
 
     # ------------------------------------------------------------- lifecycle
     def install(self) -> None:
@@ -106,29 +118,83 @@ class KaggleComfy:
         else:
             log.info("frp.enabled=false; ComfyUI stays on 127.0.0.1")
 
-    def run_comfyui(self) -> None:
-        """Start ComfyUI in the foreground (blocks the notebook cell)."""
+    def run_comfyui(self, watchdog_enabled: bool | None = None) -> int:
+        """Start ComfyUI in the foreground (blocks the notebook cell).
+
+        With ``watchdog_enabled`` enabled (the default comes from
+        ``config.watchdog.enabled``; ``None`` means "use the config") the
+        process is restarted after an abnormal exit or when ``/system_stats``
+        stays unresponsive.  Returns 0 when stopped normally, 1 when the
+        watchdog gives up, and 130 when the cell is interrupted.
+        """
         if self.config.frp.enabled:
             log.info("ComfyUI will be available at %s", self.public_url())
         else:
             log.info(
-                "ComfyUI will be available at http://127.0.0.1:%s",
-                self.config.comfyui.port,
+                "ComfyUI will be available at %s",
+                _local_url(self.config.comfyui.port),
             )
-        self.comfy.run_comfyui()
 
-    def run(self) -> None:
+        if watchdog_enabled is None:
+            watchdog_enabled = self.config.watchdog.enabled
+
+        if not watchdog_enabled or self.runner.dry_run:
+            if watchdog_enabled:
+                log.info(
+                    "[dry-run] watchdog would supervise ComfyUI on port %s",
+                    self.config.comfyui.port,
+                )
+            else:
+                log.info(
+                    "Watchdog disabled; starting ComfyUI without supervision"
+                )
+            self.comfy.run_comfyui()
+            return EXIT_CLEAN
+
+        self.comfy.require_installed()
+        self._supervisor = self.build_supervisor()
+        return self._supervisor.run()
+
+    def build_supervisor(self) -> Supervisor:
+        """Build a supervisor for ComfyUI using the current config."""
+        settings = self.config.watchdog
+        health_url = (
+            f"{_local_url(self.config.comfyui.port)}{settings.health_path}"
+        )
+        spawner = SubprocessSpawner(
+            self.comfy.build_command(),
+            cwd=self.comfy.comfy_dir,
+            env=self.comfy.build_env(),
+            log_path=settings.log_path,
+            log_max_bytes=settings.log_max_bytes,
+            logger=self.log,
+        )
+        return Supervisor(
+            name="ComfyUI",
+            spawn=spawner,
+            probe=HttpHealthProbe(health_url, timeout=settings.timeout),
+            settings=settings,
+            logger=self.log,
+        )
+
+    def run(self) -> int:
         """Full pipeline: prepare, start services, run ComfyUI."""
         self.prepare()
         self.start_services()
-        self.run_comfyui()
+        return self.run_comfyui()
 
     # --------------------------------------------------------------- helpers
     def public_url(self) -> str:
         return self.frp.public_url()
 
+    def watchdog_status(self) -> SupervisorStatus:
+        """Return live supervisor state, or the last persisted state."""
+        if self._supervisor is not None:
+            return self._supervisor.status()
+        return Supervisor.load_state(self.config.watchdog.state_path)
+
     def filebrowser_url(self) -> str:
-        base = self.public_url() or f"http://127.0.0.1:{self.config.filebrowser.port}"
+        base = self.public_url() or _local_url(self.config.filebrowser.port)
         return f"{base}{self.config.filebrowser.base_url.rstrip('/')}/"
 
     def list_models(self, limit: int = 40) -> List[str]:

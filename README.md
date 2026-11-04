@@ -21,6 +21,7 @@ src/kgcomfy/
   shell.py                        # 命令执行、aria2 下载、解压、软链、安全删除
   secrets.py                      # Kaggle Secrets / 环境变量 / 显式覆盖
   comfyui.py                      # ComfyUI 与便携 Python 运行时、自定义节点
+  supervisor.py                   # ComfyUI 看门狗：健康检查、重启、日志/状态
   models.py                       # 模型路径映射、清理
   frp.py                          # frpc 安装、TOML 生成、后台启动
   filebrowser.py                  # filebrowser 安装、YAML 生成、后台启动
@@ -70,7 +71,8 @@ app.update()         # 受 cfg.updates 控制
 app.cleanup()        # 受 cfg.cleanup.enabled 控制
 app.link_models()    # 建立模型软链
 app.start_services() # filebrowser + frpc（守护线程）
-app.run_comfyui()    # 前台阻塞
+app.run_comfyui()    # 前台阻塞；默认由 watchdog 自动重启
+# app.run_comfyui(watchdog_enabled=False)  # 关闭看门狗，保持旧行为
 
 # 或者一行：
 # app.run()
@@ -159,6 +161,45 @@ models:
 | `env` | 启动环境变量，默认 `CUDA_VISIBLE_DEVICES=0,1`、`MPLBACKEND=Agg` |
 | `requirements_file` | ComfyUI 依赖文件名 |
 
+### `watchdog`
+
+Phase 1：在启动 ComfyUI 的 Cell 内做进程监管。`app.run_comfyui()` 默认读取
+`watchdog.enabled`；需要旧行为时用 `app.run_comfyui(watchdog_enabled=False)`。
+
+| 字段 | 说明 |
+| --- | --- |
+| `enabled` | 是否启用看门狗，默认 `true` |
+| `health_path` | 健康检查路径，默认 `/system_stats`；完整地址为 `http://127.0.0.1:<comfyui.port><health_path>` |
+| `interval` / `timeout` | 轮询间隔 / 单次 HTTP 超时（秒） |
+| `failures` | 启动宽限期结束后，连续失败多少次触发重启 |
+| `startup_grace` | 启动宽限期（秒）；模型加载期间健康检查失败不计数 |
+| `backoff_initial` / `backoff_max` | 重启退避初始值/上限（秒），按 2 倍递增 |
+| `max_restarts` / `restart_window` | 时间窗口内的重启次数上限；超过后熔断并停止 |
+| `shutdown_timeout` | SIGTERM 后等待多久再 SIGKILL（会终止整个进程组） |
+| `log_path` | ComfyUI stdout/stderr 日志；异常退出时自动 tail 到 notebook |
+| `state_path` | 看门狗状态 JSON，可用 `app.watchdog_status()` 读取 |
+| `log_max_bytes` | 日志超过该大小后轮转为 `.1`；运行期间也会轮转，0 表示不轮转 |
+
+行为说明：
+
+- ComfyUI 进程异常退出（退出码非 0）会重启；退出码 0 视为主动停止，看门狗结束。
+- 看门狗主动终止假死进程时，即使子进程退出码为 0，也会按异常重启。
+- 中断 Cell（Ctrl-C）会优雅停止，不触发重启。
+- 进程还活着但 `/system_stats` 连续失败时，先 SIGTERM 整个进程组，再 SIGKILL，然后重启。
+- 一旦健康检查成功过，后续失败会立即计数，不受 `startup_grace` 影响。
+- 重启后端口不变，frpc/filebrowser 不需要重建；正在排队的任务和已加载模型会丢失，冷启动需要时间。
+- 超过 `max_restarts` 后停止并写入 `state=failed`，避免 OOM/坏节点无限重启消耗 GPU 配额。
+- 如果模型加载时间超过 `startup_grace`，需要调大该值，否则启动阶段会被判定为失败。
+
+`app.run_comfyui()` / `app.run()` 的返回值：`0` 正常停止，`1` 看门狗熔断或看门狗自身异常，`130` Cell 被中断。
+
+Kaggle 使用建议：
+
+- **交互模式**：启动 ComfyUI 的 Cell 必须保持运行；自动重启只在 Cell 生命周期内有效。
+- **无人值守长跑**：用 **Save & Run All**（batch），关掉浏览器也会继续执行，ComfyUI 仍可通过 frp 访问；
+  但仍受单次 Session 上限（CPU/GPU 12h、TPU 9h）和每周 GPU 配额限制。
+- 看门狗不能跨 Session 存活；Session 停止后 Kaggle 会销毁容器。
+
 ### `frp`
 
 | 字段 | 说明 |
@@ -245,6 +286,7 @@ pub.modelscope_upload("/kaggle/working/ComfyUI.tar", "ComfyUI.tar")
 | filebrowser 下载、`config.yaml` 拼接 | `filebrowser` |
 | `threading.Thread(...).start()` | `app.start_services()` |
 | 启动 ComfyUI 的重复命令 | `app.run_comfyui()` |
+| 手动重启 ComfyUI / 守护进程 | `watchdog.*` + `app.run_comfyui()` |
 | 硬编码 ModelScope token | `secrets.modelscope_token` |
 | 从 Kaggle Secrets 取 `frp_token` | `secrets.frp_token` |
 

@@ -49,7 +49,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "prepare":
             app.prepare()
         elif args.command == "run":
-            app.run()
+            return app.run()
         return 0
     except (ConfigError, FileNotFoundError) as exc:
         print(f"error: {exc}", file=sys.stderr)

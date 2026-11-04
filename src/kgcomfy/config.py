@@ -129,6 +129,22 @@ class ComfyUIConfig:
     )
     requirements_file: str = "requirements.txt"
 
+    def has_port_argument(self) -> bool:
+        """Return True when ``args`` already contains --port."""
+        return any(
+            arg == "--port" or arg.startswith("--port=") for arg in self.args
+        )
+
+    def port_values(self) -> List[str]:
+        """Return the values of --port/--port=N in ``args``."""
+        values: List[str] = []
+        for index, arg in enumerate(self.args):
+            if arg.startswith("--port="):
+                values.append(arg.split("=", 1)[1])
+            elif arg == "--port" and index + 1 < len(self.args):
+                values.append(self.args[index + 1])
+        return values
+
 
 @dataclass
 class FrpProxyConfig:
@@ -222,6 +238,32 @@ class PublishConfig:
 
 
 @dataclass
+class WatchdogConfig:
+    """ComfyUI process supervision (Phase 1: in-cell watchdog)."""
+
+    enabled: bool = True
+    #: HTTP path probed on the ComfyUI port to detect a hung process.
+    health_path: str = "/system_stats"
+    interval: float = 20.0
+    timeout: float = 5.0
+    #: Consecutive failed probes after startup_grace before a restart.
+    failures: int = 3
+    #: Startup period where failed probes are ignored (model loading).
+    startup_grace: float = 300.0
+    backoff_initial: float = 5.0
+    backoff_max: float = 300.0
+    #: At most max_restarts restarts inside restart_window seconds.
+    max_restarts: int = 5
+    restart_window: float = 600.0
+    #: Seconds to wait after SIGTERM before killing the process group.
+    shutdown_timeout: float = 15.0
+    log_path: str = "/kaggle/working/comfyui.log"
+    state_path: str = "/kaggle/working/comfyui-watchdog.json"
+    #: Rotate the child log once it grows past this size (0 disables).
+    log_max_bytes: int = 50 * 1024 * 1024
+
+
+@dataclass
 class Config:
     log_level: str = "INFO"
     dry_run: bool = False
@@ -230,6 +272,7 @@ class Config:
     custom_nodes: List[CustomNodeConfig] = field(default_factory=list)
     models: List[ModelLinkConfig] = field(default_factory=list)
     comfyui: ComfyUIConfig = field(default_factory=ComfyUIConfig)
+    watchdog: WatchdogConfig = field(default_factory=WatchdogConfig)
     frp: FrpConfig = field(default_factory=FrpConfig)
     filebrowser: FileBrowserConfig = field(default_factory=FileBrowserConfig)
     secrets: Dict[str, SecretConfig] = field(default_factory=dict)
@@ -263,6 +306,74 @@ class Config:
                     f"models[{index}].mode={item.mode!r} is invalid; "
                     f"expected one of {sorted(valid_modes)}"
                 )
+
+        for literal_port in self.comfyui.port_values():
+            if literal_port and literal_port != "{port}":
+                if literal_port != str(self.comfyui.port):
+                    errors.append(
+                        f"comfyui.args uses --port={literal_port} but "
+                        f"comfyui.port={self.comfyui.port}; use '{{port}}' "
+                        "or make them match"
+                    )
+        if any(
+            arg == "--port" and index + 1 >= len(self.comfyui.args)
+            for index, arg in enumerate(self.comfyui.args)
+        ):
+            errors.append("comfyui.args contains --port without a value")
+
+        watchdog = self.watchdog
+        watchdog_rules = [
+            ("interval", watchdog.interval > 0, "must be greater than 0"),
+            ("timeout", watchdog.timeout > 0, "must be greater than 0"),
+            ("failures", watchdog.failures >= 1, "must be at least 1"),
+            (
+                "startup_grace",
+                watchdog.startup_grace >= 0,
+                "must not be negative",
+            ),
+            (
+                "backoff_initial",
+                watchdog.backoff_initial > 0,
+                "must be greater than 0",
+            ),
+            (
+                "max_restarts",
+                watchdog.max_restarts >= 0,
+                "must not be negative",
+            ),
+            (
+                "restart_window",
+                watchdog.restart_window > 0,
+                "must be greater than 0",
+            ),
+            (
+                "shutdown_timeout",
+                watchdog.shutdown_timeout >= 0,
+                "must not be negative",
+            ),
+            (
+                "log_max_bytes",
+                watchdog.log_max_bytes >= 0,
+                "must not be negative",
+            ),
+        ]
+        for name, valid, message in watchdog_rules:
+            if not valid:
+                errors.append(f"watchdog.{name} {message}")
+        if not watchdog.health_path.startswith("/"):
+            errors.append(
+                "watchdog.health_path must start with '/' "
+                f"(got {watchdog.health_path!r})"
+            )
+        if watchdog.backoff_max < watchdog.backoff_initial:
+            errors.append(
+                "watchdog.backoff_max must be greater than or equal to "
+                "watchdog.backoff_initial"
+            )
+        if not watchdog.log_path:
+            errors.append("watchdog.log_path must not be empty")
+        if not watchdog.state_path:
+            errors.append("watchdog.state_path must not be empty")
 
         if self.frp.enabled:
             if not self.frp.server_addr:

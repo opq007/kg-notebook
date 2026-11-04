@@ -268,6 +268,29 @@ class ComfyUIInstallerTests(unittest.TestCase):
         self.assertIn("--disable-pinned-memory", command)
         self.assertIn("--force-fp16", command)
 
+    def test_build_command_is_reusable(self):
+        cfg = self._config(
+            comfyui={
+                "port": 9999,
+                "args": ["--port={port}", "--cpu"],
+            }
+        )
+        installer = ComfyUIInstaller(cfg, Runner(dry_run=True))
+
+        command = installer.build_command()
+        self.assertEqual(command[0], cfg.runtime.python_bin)
+        self.assertEqual(command[1], "main.py")
+        self.assertEqual(command[2], "--port=9999")
+        self.assertEqual(command[-1], "--cpu")
+
+    def test_build_env_returns_overrides(self):
+        cfg = self._config(
+            comfyui={"env": {"CUDA_VISIBLE_DEVICES": "1", "NUM": 2}}
+        )
+        env = ComfyUIInstaller(cfg, Runner(dry_run=True)).build_env()
+
+        self.assertEqual(env, {"CUDA_VISIBLE_DEVICES": "1", "NUM": "2"})
+
 
 if __name__ == "__main__":
     unittest.main()

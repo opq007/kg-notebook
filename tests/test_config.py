@@ -6,6 +6,15 @@ from pathlib import Path
 from kgcomfy.config import ConfigError, load_config, resolve_config_path
 
 
+def minimal_config(**extra):
+    data = {
+        "frp": {"enabled": False},
+        "filebrowser": {"enabled": False},
+    }
+    data.update(extra)
+    return data
+
+
 class ConfigTests(unittest.TestCase):
     def test_packaged_tts_config_loads(self):
         cfg = load_config("tts-img.yaml")
@@ -17,6 +26,71 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(cfg.frp.server_addr, "oracle2.120168.xyz")
         self.assertEqual(cfg.filebrowser.port, 8012)
         self.assertEqual(cfg.comfyui.port, 8188)
+        self.assertTrue(cfg.watchdog.enabled)
+        self.assertEqual(cfg.watchdog.health_path, "/system_stats")
+        self.assertEqual(
+            cfg.watchdog.state_path, "/kaggle/working/comfyui-watchdog.json"
+        )
+
+    def test_watchdog_overrides(self):
+        cfg = load_config(
+            "tts-img.yaml",
+            {"watchdog": {"interval": 5, "max_restarts": 2}},
+        )
+        self.assertEqual(cfg.watchdog.interval, 5)
+        self.assertEqual(cfg.watchdog.max_restarts, 2)
+        self.assertEqual(cfg.watchdog.health_path, "/system_stats")
+
+    def test_watchdog_health_path_must_be_absolute(self):
+        cfg = load_config(
+            minimal_config(watchdog={"health_path": "system_stats"})
+        )
+        with self.assertRaises(ConfigError) as ctx:
+            cfg.validate()
+        self.assertIn("watchdog.health_path", str(ctx.exception))
+
+    def test_watchdog_backoff_must_be_ordered(self):
+        cfg = load_config(
+            minimal_config(
+                watchdog={"backoff_initial": 10, "backoff_max": 1}
+            )
+        )
+        with self.assertRaises(ConfigError) as ctx:
+            cfg.validate()
+        self.assertIn("watchdog.backoff_max", str(ctx.exception))
+
+    def test_disabled_watchdog_still_validates_settings(self):
+        cfg = load_config(
+            minimal_config(
+                watchdog={
+                    "enabled": False,
+                    "health_path": "",
+                    "interval": 0,
+                }
+            )
+        )
+        with self.assertRaises(ConfigError) as ctx:
+            cfg.validate()
+        self.assertIn("watchdog.health_path", str(ctx.exception))
+        self.assertIn("watchdog.interval", str(ctx.exception))
+
+    def test_comfyui_literal_port_must_match_config(self):
+        cfg = load_config(
+            minimal_config(
+                comfyui={"port": 8188, "args": ["--port=9999"]}
+            )
+        )
+        with self.assertRaises(ConfigError) as ctx:
+            cfg.validate()
+        self.assertIn("comfyui.args uses --port=9999", str(ctx.exception))
+
+    def test_comfyui_literal_port_matching_config_is_allowed(self):
+        cfg = load_config(
+            minimal_config(
+                comfyui={"port": 9999, "args": ["--port=9999"]}
+            )
+        )
+        cfg.validate()  # must not raise
 
     def test_resolve_by_bare_name(self):
         path = resolve_config_path("tts-img")

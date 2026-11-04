@@ -1,3 +1,4 @@
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -68,6 +69,42 @@ class KaggleComfyTests(unittest.TestCase):
         archive = app.publisher().create_tar("/tmp/out.tar", "/tmp/ComfyUI")
         self.assertEqual(Path(archive), Path("/tmp/out.tar"))
         self.assertTrue(any(item.startswith("tar -cf") for item in app.commands))
+
+    def test_run_comfyui_dry_run_still_builds_command(self):
+        app = KaggleComfy(offline_config())
+        result = app.run_comfyui()
+        self.assertEqual(result, 0)
+        command = app.commands[-1]
+        self.assertIn("main.py", command)
+        self.assertIn("--port=8188", command)
+
+    def test_run_comfyui_can_disable_watchdog(self):
+        app = KaggleComfy(offline_config(watchdog={"enabled": True}))
+        result = app.run_comfyui(watchdog_enabled=False)
+        self.assertEqual(result, 0)
+        self.assertIn("main.py", app.commands[-1])
+
+    def test_build_supervisor_uses_watchdog_config(self):
+        app = KaggleComfy(
+            offline_config(
+                comfyui={"port": 9999},
+                watchdog={"health_path": "/health", "interval": 7},
+            )
+        )
+        supervisor = app.build_supervisor()
+        self.assertEqual(supervisor.settings.health_path, "/health")
+        self.assertEqual(supervisor.settings.interval, 7)
+        self.assertEqual(supervisor.status()["health_path"], "/health")
+
+    def test_watchdog_status_reads_persisted_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "watchdog.json"
+            state.write_text('{"state": "failed", "restarts": 3}', encoding="utf-8")
+            app = KaggleComfy(
+                offline_config(watchdog={"state_path": str(state)})
+            )
+            self.assertEqual(app.watchdog_status()["state"], "failed")
+            self.assertEqual(app.watchdog_status()["restarts"], 3)
 
 
 if __name__ == "__main__":

@@ -15,6 +15,14 @@ from typing import Any, Dict, List, Mapping, Sequence, Union
 Command = Union[str, Sequence[str]]
 
 
+def merge_env(env: Mapping[str, Any] | None = None) -> Dict[str, str]:
+    """Return a copy of ``os.environ`` with ``env`` overlaid as strings."""
+    merged = {str(key): str(value) for key, value in os.environ.items()}
+    if env:
+        merged.update({str(key): str(value) for key, value in env.items()})
+    return merged
+
+
 class CommandError(RuntimeError):
     """Raised when a command exits with a non-zero status."""
 
@@ -66,9 +74,7 @@ class Runner:
         if self.dry_run:
             return subprocess.CompletedProcess(command, 0, "", "")
 
-        full_env = os.environ.copy()
-        if env:
-            full_env.update({str(key): str(value) for key, value in env.items()})
+        full_env = merge_env(env)
 
         kwargs: Dict[str, Any] = {
             "cwd": str(cwd) if cwd else None,
