@@ -104,7 +104,7 @@ watchdog:
   # 健康检查路径；完整地址为 http://127.0.0.1:<comfyui.port><health_path>
   health_path: /system_stats
   # 轮询/健康检查间隔（秒）
-  interval: 20
+  interval: 60
   # 单次 HTTP 健康检查超时（秒）
   timeout: 5
   # 启动宽限期结束后，连续失败多少次触发重启
