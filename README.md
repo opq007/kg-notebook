@@ -22,6 +22,7 @@ src/kgcomfy/
   secrets.py                      # Kaggle Secrets / 环境变量 / 显式覆盖
   comfyui.py                      # ComfyUI 与便携 Python 运行时、自定义节点
   supervisor.py                   # ComfyUI 看门狗：健康检查、重启、日志/状态
+  webhook.py                      # 生命周期通知：飞书/钉钉/企业微信/Slack/通用 JSON
   models.py                       # 模型路径映射、清理
   frp.py                          # frpc 安装、TOML 生成、后台启动
   filebrowser.py                  # filebrowser 安装、YAML 生成、后台启动
@@ -171,8 +172,8 @@ Phase 1：在启动 ComfyUI 的 Cell 内做进程监管。`app.run_comfyui()` �
 | `enabled` | 是否启用看门狗，默认 `true` |
 | `health_path` | 健康检查路径，默认 `/system_stats`；完整地址为 `http://127.0.0.1:<comfyui.port><health_path>` |
 | `interval` / `timeout` | 轮询间隔 / 单次 HTTP 超时（秒） |
-| `failures` | 启动宽限期结束后，连续失败多少次触发重启 |
-| `startup_grace` | 启动宽限期（秒）；模型加载期间健康检查失败不计数 |
+| `failures` | 端口关闭时，连续失败多少次触发重启 |
+| `startup_grace` | 首次健康检查成功前的启动宽限期；此期间失败不计数 |
 | `backoff_initial` / `backoff_max` | 重启退避初始值/上限（秒），按 2 倍递增 |
 | `max_restarts` / `restart_window` | 时间窗口内的重启次数上限；超过后熔断并停止 |
 | `shutdown_timeout` | SIGTERM 后等待多久再 SIGKILL（会终止整个进程组） |
@@ -185,11 +186,13 @@ Phase 1：在启动 ComfyUI 的 Cell 内做进程监管。`app.run_comfyui()` �
 - ComfyUI 进程异常退出（退出码非 0）会重启；退出码 0 视为主动停止，看门狗结束。
 - 看门狗主动终止假死进程时，即使子进程退出码为 0，也会按异常重启。
 - 中断 Cell（Ctrl-C）会优雅停止，不触发重启。
-- 进程还活着但 `/system_stats` 连续失败时，先 SIGTERM 整个进程组，再 SIGKILL，然后重启。
-- 一旦健康检查成功过，后续失败会立即计数，不受 `startup_grace` 影响。
+- `/system_stats` 失败后，看门狗会再探测 ComfyUI 端口：端口仍在监听时视为忙碌（长视频任务/GIL 阻塞），
+  不累计失败、不重启；只有进程退出或端口关闭时，才按 `failures` 的次数重启（先 SIGTERM，再 SIGKILL）。
+- 一旦健康检查成功过，后续“端口已关闭”的失败会立即计数，不受 `startup_grace` 影响。
+- 端口兜底能避免长视频任务被误杀；代价是进程活着、端口也在但事件循环真正死锁时不会自动重启，需要手动处理。
 - 重启后端口不变，frpc/filebrowser 不需要重建；正在排队的任务和已加载模型会丢失，冷启动需要时间。
 - 超过 `max_restarts` 后停止并写入 `state=failed`，避免 OOM/坏节点无限重启消耗 GPU 配额。
-- 如果模型加载时间超过 `startup_grace`，需要调大该值，否则启动阶段会被判定为失败。
+- 如果首次启动（尚未成功响应过健康检查）超过 `startup_grace`，需要调大该值，否则启动阶段可能被判定为失败。
 
 `app.run_comfyui()` / `app.run()` 的返回值：`0` 正常停止，`1` 看门狗熔断或看门狗自身异常，`130` Cell 被中断。
 
@@ -199,6 +202,95 @@ Kaggle 使用建议：
 - **无人值守长跑**：用 **Save & Run All**（batch），关掉浏览器也会继续执行，ComfyUI 仍可通过 frp 访问；
   但仍受单次 Session 上限（CPU/GPU 12h、TPU 9h）和每周 GPU 配额限制。
 - 看门狗不能跨 Session 存活；Session 停止后 Kaggle 会销毁容器。
+
+### `webhook`
+
+ComfyUI 生命周期的推送通知，兼容飞书、钉钉（含加签）、企业微信、Slack 和通用 JSON。
+默认关闭；webhook URL 里通常带 token，建议用环境变量或 Kaggle Secrets 注入，不要提交到仓库。
+
+| 字段 | 说明 |
+| --- | --- |
+| `enabled` | 是否启用，默认 `false` |
+| `provider` | `auto`（按 URL 识别）/ `feishu` / `dingtalk` / `wecom` / `slack` / `generic` |
+| `url` | webhook 地址；可用 `KGCOMFY_WEBHOOK_URL` 覆盖 |
+| `secret` | 飞书/钉钉加签密钥；可用 `KGCOMFY_WEBHOOK_SECRET` 覆盖 |
+| `url_secret` / `sign_secret` | 逻辑密钥名；直接字段为空时经 `secrets` / 环境变量 / Kaggle Secrets 解析 |
+| `timeout` | 单次 HTTP 超时（秒），默认 `5` |
+| `title` | 消息标题前缀，默认 `ComfyUI`；钉钉开启“自定义关键词”时可把关键词放进标题 |
+| `events` | 订阅的事件；留空表示全部。默认 `started/crashed/start_failed/restarted/failed` |
+| `include_log_tail` | 意外停止时是否附带日志尾部，默认 `false` |
+| `log_tail_lines` | 日志尾部行数，默认 `10` |
+
+事件：
+
+| 事件 | 触发时机 |
+| --- | --- |
+| `started` | ComfyUI 首次拉起进程（是否可访问见 `ready`） |
+| `ready` | 健康检查首次通过（每个进程代一次） |
+| `crashed` | 进程异常退出，或健康检查失败被终止 |
+| `restarting` | 进入重启退避等待 |
+| `restarted` | 重启后进程可访问（健康检查通过，或健康检查超时但端口仍在监听） |
+| `start_failed` | 启动/重启命令或准备阶段失败（spawn、安装、prepare、start_services） |
+| `failed` | 达到 `max_restarts`，或看门狗自身异常，停止重启 |
+| `stopped` | 正常退出、手动停止或 Ctrl-C |
+
+> `restarted` 在重启后的进程通过健康检查时发送；如果健康检查持续超时但端口仍在监听，也会发送一次，
+> 并附带 `reason=health check timed out; port is listening`。如需每个进程代首次健康检查通过时也收到消息，把 `ready` 加入 `events`。
+> 非看门狗路径没有 spawn 成功回调，`started` 表示“启动中”；失败时会随后发送 `start_failed`。
+
+飞书示例（机器人未开启加签时只需要 URL）：
+
+```python
+import os
+os.environ["KGCOMFY_WEBHOOK_URL"] = "https://open.feishu.cn/open-apis/bot/v2/hook/xxx"
+cfg = load_config("tts-img.yaml", overrides={"webhook": {"enabled": True}})
+```
+
+钉钉示例（开启“加签”时同时设置 secret）：
+
+```python
+import os
+os.environ["KGCOMFY_WEBHOOK_URL"] = "https://oapi.dingtalk.com/robot/send?access_token=xxx"
+os.environ["KGCOMFY_WEBHOOK_SECRET"] = "SECxxx"
+cfg = load_config("tts-img.yaml", overrides={"webhook": {"enabled": True}})
+```
+
+环境变量（优先级高于 YAML 和 `load_config(..., overrides=...)`）：
+
+| 变量 | 说明 |
+| --- | --- |
+| `KGCOMFY_WEBHOOK_ENABLED` | `true` / `false` |
+| `KGCOMFY_WEBHOOK_URL` | webhook 地址 |
+| `KGCOMFY_WEBHOOK_PROVIDER` | 平台；默认按 URL 自动识别 |
+| `KGCOMFY_WEBHOOK_SECRET` | 加签密钥 |
+| `KGCOMFY_WEBHOOK_TITLE` | 标题前缀 |
+| `KGCOMFY_WEBHOOK_TIMEOUT` | 超时秒数 |
+| `KGCOMFY_WEBHOOK_EVENTS` | 逗号分隔事件，`all` 表示全部 |
+| `KGCOMFY_WEBHOOK_URL_SECRET` / `KGCOMFY_WEBHOOK_SIGN_SECRET` | 覆盖 `url_secret` / `sign_secret` 逻辑密钥名 |
+| `KGCOMFY_WEBHOOK_LOG_TAIL` / `KGCOMFY_WEBHOOK_LOG_TAIL_LINES` | 是否附带日志尾部及行数 |
+| `FEISHU_WEBHOOK_URL` / `DINGTALK_WEBHOOK_URL` / `WECOM_WEBHOOK_URL` / `SLACK_WEBHOOK_URL` | 未设置通用 URL 时的平台别名；对应 `*_WEBHOOK_SECRET` 只与自己的 URL 配对 |
+
+Kaggle Secrets：
+
+```yaml
+webhook:
+  enabled: true
+  url_secret: webhook_url
+  sign_secret: webhook_secret
+```
+
+然后在 Notebook 的 Add-ons → Secrets 里添加 `webhook_url` / `webhook_secret` 即可。
+
+部署前可以先发一条测试消息：
+
+```bash
+kgcomfy test-webhook --config tts-img.yaml
+```
+
+生命周期通知通过后台 daemon 线程串行发送，不阻塞 ComfyUI 启动或看门狗重启；`test-webhook` 仍同步发送以便返回结果。
+通知是“尽力而为”：网络失败、平台返回错误只会写 warning；`webhook.enabled=false` 时不校验 webhook 字段，
+`webhook.enabled=true` 但 URL 解析不到时也只写 warning 并禁用通知；`dry_run=true` 时不发送。
+`show-config` 会把 `webhook.url` / `webhook.secret` 打码。
 
 ### `frp`
 

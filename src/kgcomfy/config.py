@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import os
 import types
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from pathlib import Path
@@ -33,6 +34,42 @@ CONFIG_DIR = PACKAGE_DIR / "configs"
 _UNION_ORIGINS = (Union,)
 if hasattr(types, "UnionType"):  # Python 3.10+
     _UNION_ORIGINS = _UNION_ORIGINS + (types.UnionType,)
+
+#: Webhook platforms understood by :mod:`kgcomfy.webhook`.
+WEBHOOK_PROVIDERS = ("auto", "feishu", "dingtalk", "wecom", "slack", "generic")
+
+#: Lifecycle events the watchdog can publish.
+WEBHOOK_EVENTS = (
+    "started",
+    "ready",
+    "crashed",
+    "restarting",
+    "restarted",
+    "start_failed",
+    "failed",
+    "stopped",
+)
+
+#: Default lifecycle events, including failed restart attempts.
+DEFAULT_WEBHOOK_EVENTS = (
+    "started",
+    "crashed",
+    "start_failed",
+    "restarted",
+    "failed",
+)
+
+
+def normalize_webhook_events(events: Any) -> List[str]:
+    """Lower-case, strip and de-duplicate a webhook event list."""
+    if isinstance(events, str):
+        events = events.split(",")
+    normalized: List[str] = []
+    for event in events or []:
+        value = str(event).strip().lower()
+        if value and value not in normalized:
+            normalized.append(value)
+    return normalized
 
 
 class ConfigError(ValueError):
@@ -246,9 +283,10 @@ class WatchdogConfig:
     health_path: str = "/system_stats"
     interval: float = 20.0
     timeout: float = 5.0
-    #: Consecutive failed probes after startup_grace before a restart.
+    #: Consecutive failed probes with a closed port before a restart.  A failed
+    #: HTTP probe while the port is still listening is treated as "busy".
     failures: int = 3
-    #: Startup period where failed probes are ignored (model loading).
+    #: Startup period where failed probes are ignored before the first success.
     startup_grace: float = 300.0
     backoff_initial: float = 5.0
     backoff_max: float = 300.0
@@ -264,6 +302,162 @@ class WatchdogConfig:
 
 
 @dataclass
+class WebhookConfig:
+    """ComfyUI lifecycle notifications over HTTP.
+
+    Payloads for Feishu, DingTalk (including signing), WeCom, Slack and a
+    generic JSON shape are built by :mod:`kgcomfy.webhook`.  The URL and signing
+    secret can also be resolved at runtime through ``url_secret`` /
+    ``sign_secret`` (Kaggle Secrets or environment variables).
+    """
+
+    enabled: bool = False
+    #: auto | feishu | dingtalk | wecom | slack | generic
+    provider: str = "auto"
+    url: str = ""
+    #: Signing secret for Feishu/DingTalk custom bots.
+    secret: str = ""
+    #: Logical secret names resolved through SecretResolver.
+    url_secret: str = ""
+    sign_secret: str = ""
+    timeout: float = 5.0
+    #: Prefix of every message title; can double as a DingTalk keyword.
+    title: str = "ComfyUI"
+    #: Empty means "all events".
+    events: List[str] = field(default_factory=lambda: list(DEFAULT_WEBHOOK_EVENTS))
+    #: Attach the tail of the ComfyUI log to unexpected-stop messages.
+    include_log_tail: bool = False
+    log_tail_lines: int = 10
+
+    def __post_init__(self) -> None:
+        self.provider = (self.provider or "auto").strip().lower()
+        self.events = normalize_webhook_events(self.events)
+
+    def apply_env(
+        self, env: Mapping[str, str] | None = None
+    ) -> "WebhookConfig":
+        """Apply ``KGCOMFY_WEBHOOK_*`` and platform aliases to this config.
+
+        Environment values win over YAML; repeated calls re-apply, which lets
+        a notebook set variables after ``load_config()``.
+        """
+        values = os.environ if env is None else env
+
+        def raw(name: str) -> str:
+            value = values.get(name, "")
+            return str(value).strip() if value is not None else ""
+
+        enabled = _env_bool(
+            raw("KGCOMFY_WEBHOOK_ENABLED"), "KGCOMFY_WEBHOOK_ENABLED"
+        )
+        if enabled is not None:
+            self.enabled = enabled
+
+        provider_env = raw("KGCOMFY_WEBHOOK_PROVIDER")
+        if provider_env:
+            self.provider = provider_env.lower()
+
+        aliases = (
+            ("feishu", "FEISHU_WEBHOOK"),
+            ("dingtalk", "DINGTALK_WEBHOOK"),
+            ("wecom", "WECOM_WEBHOOK"),
+            ("slack", "SLACK_WEBHOOK"),
+        )
+
+        alias_provider = ""
+        alias_prefix = ""
+        url = raw("KGCOMFY_WEBHOOK_URL")
+        if not url:
+            for candidate_provider, prefix in aliases:
+                alias_url = raw(f"{prefix}_URL")
+                if alias_url:
+                    url = alias_url
+                    alias_provider = candidate_provider
+                    alias_prefix = prefix
+                    break
+
+        if alias_provider and not provider_env:
+            if self.provider not in ("auto", alias_provider):
+                log.warning(
+                    "webhook.provider=%s overridden by %s_URL",
+                    self.provider,
+                    alias_prefix,
+                )
+            self.provider = alias_provider
+        elif (
+            alias_provider
+            and provider_env
+            and provider_env.lower() != alias_provider
+        ):
+            log.warning(
+                "webhook.provider=%s does not match %s_URL; keeping provider",
+                provider_env,
+                alias_prefix,
+            )
+
+        # Platform-specific secrets are only paired with their own alias URL;
+        # KGCOMFY_WEBHOOK_SECRET remains the generic override.
+        secret = raw("KGCOMFY_WEBHOOK_SECRET")
+        if not secret and alias_provider:
+            for candidate_provider, prefix in aliases:
+                if candidate_provider == alias_provider:
+                    secret = raw(f"{prefix}_SECRET")
+                    break
+
+        if url:
+            self.url = url
+        if secret:
+            self.secret = secret
+
+        url_secret = raw("KGCOMFY_WEBHOOK_URL_SECRET")
+        if url_secret:
+            self.url_secret = url_secret
+
+        sign_secret = raw("KGCOMFY_WEBHOOK_SIGN_SECRET")
+        if sign_secret:
+            self.sign_secret = sign_secret
+
+        title = raw("KGCOMFY_WEBHOOK_TITLE")
+        if title:
+            self.title = title
+
+        timeout = raw("KGCOMFY_WEBHOOK_TIMEOUT")
+        if timeout:
+            try:
+                self.timeout = float(timeout)
+            except ValueError:
+                log.warning(
+                    "Ignoring invalid KGCOMFY_WEBHOOK_TIMEOUT=%r", timeout
+                )
+
+        events = raw("KGCOMFY_WEBHOOK_EVENTS")
+        if events:
+            self.events = (
+                list(WEBHOOK_EVENTS)
+                if events.lower() in ("all", "*")
+                else normalize_webhook_events(events.split(","))
+            )
+
+        log_tail = _env_bool(
+            raw("KGCOMFY_WEBHOOK_LOG_TAIL"), "KGCOMFY_WEBHOOK_LOG_TAIL"
+        )
+        if log_tail is not None:
+            self.include_log_tail = log_tail
+
+        log_tail_lines = raw("KGCOMFY_WEBHOOK_LOG_TAIL_LINES")
+        if log_tail_lines:
+            try:
+                self.log_tail_lines = int(log_tail_lines)
+            except ValueError:
+                log.warning(
+                    "Ignoring invalid KGCOMFY_WEBHOOK_LOG_TAIL_LINES=%r",
+                    log_tail_lines,
+                )
+
+        return self
+
+
+@dataclass
 class Config:
     log_level: str = "INFO"
     dry_run: bool = False
@@ -273,6 +467,7 @@ class Config:
     models: List[ModelLinkConfig] = field(default_factory=list)
     comfyui: ComfyUIConfig = field(default_factory=ComfyUIConfig)
     watchdog: WatchdogConfig = field(default_factory=WatchdogConfig)
+    webhook: WebhookConfig = field(default_factory=WebhookConfig)
     frp: FrpConfig = field(default_factory=FrpConfig)
     filebrowser: FileBrowserConfig = field(default_factory=FileBrowserConfig)
     secrets: Dict[str, SecretConfig] = field(default_factory=dict)
@@ -291,6 +486,26 @@ class Config:
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+    def to_redacted_dict(self) -> Dict[str, Any]:
+        """Return ``to_dict()`` with webhook credentials masked."""
+        data = self.to_dict()
+        webhook = data.get("webhook")
+        if isinstance(webhook, dict):
+            for key in ("url", "secret"):
+                if webhook.get(key):
+                    webhook[key] = "***"
+        return data
+
+    def apply_env_overrides(
+        self, env: Mapping[str, str] | None = None
+    ) -> "Config":
+        """Apply environment overrides to the webhook config.
+
+        Environment values win over YAML and ``load_config(overrides=...)``.
+        """
+        self.webhook.apply_env(env)
+        return self
 
     def validate(self) -> None:
         errors: List[str] = []
@@ -375,6 +590,24 @@ class Config:
         if not watchdog.state_path:
             errors.append("watchdog.state_path must not be empty")
 
+        webhook = self.webhook
+        if webhook.enabled:
+            if webhook.provider not in WEBHOOK_PROVIDERS:
+                errors.append(
+                    f"webhook.provider={webhook.provider!r} is invalid; "
+                    f"expected one of {list(WEBHOOK_PROVIDERS)}"
+                )
+            if webhook.timeout <= 0:
+                errors.append("webhook.timeout must be greater than 0")
+            if webhook.log_tail_lines < 0:
+                errors.append("webhook.log_tail_lines must not be negative")
+            unknown_events = sorted(set(webhook.events) - set(WEBHOOK_EVENTS))
+            if unknown_events:
+                errors.append(
+                    f"webhook.events contains unknown events: {unknown_events}; "
+                    f"expected values from {list(WEBHOOK_EVENTS)}"
+                )
+
         if self.frp.enabled:
             if not self.frp.server_addr:
                 errors.append("frp.server_addr is required when frp.enabled=true")
@@ -404,7 +637,8 @@ def load_config(
     """Load a config from YAML/JSON, a mapping, or an existing ``Config``.
 
     ``overrides`` is deep-merged on top of the loaded data, which makes small
-    per-notebook tweaks (``{"frp": {"subdomain": "tts2"}}``) cheap.
+    per-notebook tweaks (``{"frp": {"subdomain": "tts2"}}``) cheap.  Webhook
+    environment variables are applied last, so they win over ``overrides``.
     """
     if isinstance(source, Config):
         data: Dict[str, Any] = source.to_dict()
@@ -418,7 +652,7 @@ def load_config(
     if overrides:
         data = deep_merge(data, dict(overrides))
 
-    return Config.from_dict(data)
+    return Config.from_dict(data).apply_env_overrides()
 
 
 def resolve_config_path(name: str | Path) -> Path:
@@ -437,6 +671,19 @@ def resolve_config_path(name: str | Path) -> Path:
 
     searched = ", ".join(str(item) for item in candidates)
     raise FileNotFoundError(f"config file not found: {name} (searched: {searched})")
+
+
+def _env_bool(value: str, name: str) -> bool | None:
+    """Parse a boolean environment value, returning None when unset/invalid."""
+    if not value:
+        return None
+    lowered = value.lower()
+    if lowered in ("1", "true", "yes", "on"):
+        return True
+    if lowered in ("0", "false", "no", "off"):
+        return False
+    log.warning("Ignoring invalid %s=%r", name, value)
+    return None
 
 
 def deep_merge(base: Mapping[str, Any], override: Mapping[str, Any]) -> Dict[str, Any]:

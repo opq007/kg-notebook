@@ -9,9 +9,10 @@ Public entry point::
 """
 
 from .app import KaggleComfy
-from .config import Config, ConfigError, load_config
+from .config import Config, ConfigError, WebhookConfig, load_config
 from .logging_utils import setup_logging
 from .shell import CommandError, Runner, SafetyError
+from .webhook import WebhookNotifier
 
 __version__ = "0.1.0"
 
@@ -19,6 +20,8 @@ __all__ = [
     "KaggleComfy",
     "Config",
     "ConfigError",
+    "WebhookConfig",
+    "WebhookNotifier",
     "CommandError",
     "Runner",
     "SafetyError",

@@ -7,12 +7,14 @@ import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest import mock
 
 from kgcomfy.config import WatchdogConfig
 from kgcomfy.supervisor import (
     HttpHealthProbe,
     SubprocessSpawner,
     Supervisor,
+    TcpPortProbe,
     rotate_log_if_needed,
 )
 
@@ -98,6 +100,59 @@ class AlwaysFailSpawner:
         raise FileNotFoundError("missing python")
 
 
+class FailOnceSpawner:
+    def __init__(self, clock, exit_after=None):
+        self.clock = clock
+        self.exit_after = exit_after
+        self.calls = 0
+        self.created = []
+
+    def __call__(self):
+        self.calls += 1
+        if self.calls == 1:
+            raise FileNotFoundError("missing python")
+        process = FakeProcess(
+            self.clock,
+            exit_after=self.exit_after,
+            exit_code=1,
+            pid=100 + self.calls,
+        )
+        self.created.append(process)
+        return process
+
+
+class RecordingNotifier:
+    def __init__(self):
+        self.events = []
+        self.flushes = 0
+
+    def notify(self, event, summary, details=None):
+        self.events.append((event, summary, dict(details or {})))
+        return True
+
+    def notify_async(self, event, summary, details=None):
+        return self.notify(event, summary, details)
+
+    def flush(self, timeout=None):
+        self.flushes += 1
+        return True
+
+    @property
+    def names(self):
+        return [event for event, _summary, _details in self.events]
+
+
+class BoomNotifier:
+    def notify(self, event, summary, details=None):
+        raise RuntimeError("boom")
+
+    def notify_async(self, event, summary, details=None):
+        return self.notify(event, summary, details)
+
+    def flush(self, timeout=None):
+        return True
+
+
 def watchdog_settings(**overrides):
     values = {
         "interval": 1.0,
@@ -125,7 +180,15 @@ class SupervisorPolicyTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def _supervisor(self, spawner, probe, clock, **settings):
+    def _supervisor(
+        self,
+        spawner,
+        probe,
+        clock,
+        notifier=None,
+        port_open=None,
+        **settings,
+    ):
         return Supervisor(
             name="FakeComfy",
             spawn=spawner,
@@ -136,6 +199,8 @@ class SupervisorPolicyTests(unittest.TestCase):
             now=clock.time,
             sleep=clock.sleep,
             wall_clock=clock.time,
+            notifier=notifier,
+            port_open=port_open,
         )
 
     def test_gives_up_after_max_restarts(self):
@@ -368,6 +433,496 @@ class SupervisorPolicyTests(unittest.TestCase):
             Path(str(log_path) + ".1").read_bytes(), b"x" * 100
         )
 
+    def test_notifications_follow_restart_lifecycle(self):
+        clock = FakeClock()
+        spawner = RepeatingSpawner(clock, exit_after=1.0)
+        notifier = RecordingNotifier()
+        supervisor = self._supervisor(
+            spawner,
+            lambda: True,
+            clock,
+            notifier=notifier,
+            max_restarts=1,
+        )
+
+        result = supervisor.run()
+
+        self.assertEqual(result, 1)
+        self.assertEqual(
+            notifier.names,
+            [
+                "started",
+                "ready",
+                "crashed",
+                "restarting",
+                "ready",
+                "restarted",
+                "crashed",
+                "failed",
+            ],
+        )
+        self.assertEqual(notifier.events[0][2]["pid"], 101)
+        self.assertEqual(notifier.events[3][2]["delay"], "1s")
+        self.assertEqual(notifier.events[4][2]["restarts"], 1)
+        self.assertEqual(notifier.events[5][2]["restarts"], 1)
+        self.assertEqual(notifier.events[-1][2]["max_restarts"], 1)
+
+    def test_restarted_requires_a_passing_health_check(self):
+        clock = FakeClock()
+        spawner = RepeatingSpawner(clock, exit_after=1.0)
+        notifier = RecordingNotifier()
+        supervisor = self._supervisor(
+            spawner,
+            lambda: False,
+            clock,
+            notifier=notifier,
+            max_restarts=0,
+        )
+
+        result = supervisor.run()
+
+        self.assertEqual(result, 1)
+        self.assertNotIn("restarted", notifier.names)
+
+    def test_start_after_a_failed_first_spawn_is_reported_as_started(self):
+        clock = FakeClock()
+        spawner = FailOnceSpawner(clock, exit_after=1.0)
+        notifier = RecordingNotifier()
+        supervisor = self._supervisor(
+            spawner,
+            lambda: True,
+            clock,
+            notifier=notifier,
+            max_restarts=1,
+        )
+
+        result = supervisor.run()
+
+        self.assertEqual(result, 1)
+        self.assertEqual(notifier.names[:2], ["start_failed", "restarting"])
+        self.assertIn("started", notifier.names)
+        self.assertNotIn("restarted", notifier.names)
+
+    def test_ready_is_not_repeated_after_a_health_blip(self):
+        clock = FakeClock()
+        spawner = RepeatingSpawner(clock, exit_after=5.0)
+        calls = {"count": 0}
+
+        def probe():
+            calls["count"] += 1
+            return calls["count"] != 2
+
+        notifier = RecordingNotifier()
+        supervisor = self._supervisor(
+            spawner,
+            probe,
+            clock,
+            notifier=notifier,
+            failures=99,
+            max_restarts=0,
+        )
+
+        result = supervisor.run()
+
+        self.assertEqual(result, 1)
+        self.assertEqual(notifier.names.count("ready"), 1)
+
+    def test_restarted_is_not_repeated_after_a_health_blip(self):
+        clock = FakeClock()
+        spawner = RepeatingSpawner(clock, exit_after=5.0)
+        calls = {"count": 0}
+
+        def probe():
+            calls["count"] += 1
+            return calls["count"] != 7
+
+        notifier = RecordingNotifier()
+        supervisor = self._supervisor(
+            spawner,
+            probe,
+            clock,
+            notifier=notifier,
+            failures=99,
+            max_restarts=1,
+        )
+
+        result = supervisor.run()
+
+        self.assertEqual(result, 1)
+        self.assertEqual(notifier.names.count("restarted"), 1)
+
+    def test_failed_event_includes_the_log_tail(self):
+        log_path = Path(self.tmp.name) / "comfy.log"
+        log_path.write_text(
+            "\n".join(f"line{i}" for i in range(60)) + "\n",
+            encoding="utf-8",
+        )
+        clock = FakeClock()
+        spawner = RepeatingSpawner(clock, exit_after=1.0)
+        notifier = RecordingNotifier()
+        supervisor = self._supervisor(
+            spawner,
+            lambda: True,
+            clock,
+            notifier=notifier,
+            max_restarts=0,
+            log_path=str(log_path),
+        )
+
+        supervisor.run()
+
+        failed = [
+            details
+            for event, _summary, details in notifier.events
+            if event == "failed"
+        ][0]
+        self.assertIn("line0", failed["log_tail"])
+        self.assertGreater(len(failed["log_tail"]), 40)
+
+    def test_spawn_failure_notifications(self):
+        clock = FakeClock()
+        notifier = RecordingNotifier()
+        supervisor = self._supervisor(
+            AlwaysFailSpawner(),
+            lambda: True,
+            clock,
+            notifier=notifier,
+            max_restarts=0,
+        )
+
+        result = supervisor.run()
+
+        self.assertEqual(result, 1)
+        self.assertEqual(notifier.names, ["start_failed", "failed"])
+        self.assertIn(
+            "FileNotFoundError: missing python",
+            notifier.events[0][2]["error"],
+        )
+
+    def test_clean_exit_notification(self):
+        clock = FakeClock()
+        spawner = RepeatingSpawner(clock, exit_after=1.0, exit_code=0)
+        notifier = RecordingNotifier()
+        supervisor = self._supervisor(
+            spawner,
+            lambda: True,
+            clock,
+            notifier=notifier,
+            max_restarts=5,
+        )
+
+        result = supervisor.run()
+
+        self.assertEqual(result, 0)
+        self.assertEqual(notifier.names, ["started", "ready", "stopped"])
+        self.assertEqual(notifier.events[-1][2]["exit_code"], 0)
+        self.assertGreaterEqual(notifier.flushes, 1)
+
+    def test_health_failure_crash_notification_has_reason(self):
+        clock = FakeClock()
+        spawner = RepeatingSpawner(clock, exit_after=None)
+        notifier = RecordingNotifier()
+        supervisor = self._supervisor(
+            spawner,
+            lambda: False,
+            clock,
+            notifier=notifier,
+            failures=1,
+            max_restarts=0,
+        )
+
+        result = supervisor.run()
+
+        self.assertEqual(result, 1)
+        crashed = [
+            details
+            for event, _summary, details in notifier.events
+            if event == "crashed"
+        ]
+        self.assertEqual(len(crashed), 1)
+        self.assertEqual(crashed[0]["reason"], "health check failed")
+        self.assertEqual(crashed[0]["exit_code"], -15)
+
+    def test_open_port_prevents_restart_after_health_failure(self):
+        clock = FakeClock()
+        spawner = RepeatingSpawner(clock, exit_after=None)
+        calls = {"count": 0}
+
+        def probe():
+            calls["count"] += 1
+            return calls["count"] == 1
+
+        notifier = RecordingNotifier()
+        holder = {}
+
+        def on_sleep(_seconds):
+            if len(clock.sleeps) >= 3:
+                holder["supervisor"].stop()
+
+        clock.on_sleep = on_sleep
+        supervisor = self._supervisor(
+            spawner,
+            probe,
+            clock,
+            notifier=notifier,
+            port_open=lambda: True,
+            failures=1,
+            max_restarts=0,
+        )
+        holder["supervisor"] = supervisor
+
+        result = supervisor.run()
+
+        self.assertEqual(result, 0)
+        self.assertNotIn("crashed", notifier.names)
+        self.assertNotIn("failed", notifier.names)
+        self.assertEqual(supervisor.status()["state"], "stopped")
+
+    def test_closed_port_counts_health_failures(self):
+        clock = FakeClock()
+        spawner = RepeatingSpawner(clock, exit_after=None)
+        calls = {"count": 0}
+
+        def probe():
+            calls["count"] += 1
+            return calls["count"] == 1
+
+        notifier = RecordingNotifier()
+        supervisor = self._supervisor(
+            spawner,
+            probe,
+            clock,
+            notifier=notifier,
+            port_open=lambda: False,
+            failures=2,
+            max_restarts=0,
+        )
+
+        result = supervisor.run()
+
+        self.assertEqual(result, 1)
+        self.assertTrue(spawner.created[0].terminated)
+        self.assertIn("crashed", notifier.names)
+        self.assertIn("failed", notifier.names)
+
+    def test_restarted_is_reported_when_port_is_listening_but_health_times_out(
+        self,
+    ):
+        clock = FakeClock()
+        spawner = RepeatingSpawner(clock, exit_after=1.0)
+        calls = {"count": 0}
+
+        def probe():
+            calls["count"] += 1
+            return calls["count"] == 1
+
+        notifier = RecordingNotifier()
+        holder = {}
+
+        def on_sleep(_seconds):
+            if len(clock.sleeps) >= 3:
+                holder["supervisor"].stop()
+
+        clock.on_sleep = on_sleep
+        supervisor = self._supervisor(
+            spawner,
+            probe,
+            clock,
+            notifier=notifier,
+            port_open=lambda: True,
+            failures=1,
+            startup_grace=300.0,
+            max_restarts=1,
+        )
+        holder["supervisor"] = supervisor
+
+        result = supervisor.run()
+
+        self.assertEqual(result, 0)
+        self.assertEqual(notifier.names.count("restarted"), 1)
+        restarted = [
+            details
+            for event, _summary, details in notifier.events
+            if event == "restarted"
+        ][0]
+        self.assertIn("port is listening", restarted["reason"])
+
+    def test_unknown_port_state_does_not_reset_confirmed_failures(self):
+        clock = FakeClock()
+        spawner = RepeatingSpawner(clock, exit_after=None)
+        probe_calls = {"count": 0}
+        port_states = iter([False, "raise", False])
+
+        def probe():
+            probe_calls["count"] += 1
+            return probe_calls["count"] == 1
+
+        def port_open():
+            try:
+                value = next(port_states)
+            except StopIteration:
+                return False
+            if value == "raise":
+                raise RuntimeError("port check failed")
+            return value
+
+        supervisor = self._supervisor(
+            spawner,
+            probe,
+            clock,
+            port_open=port_open,
+            failures=2,
+            max_restarts=0,
+        )
+
+        result = supervisor.run()
+
+        self.assertEqual(result, 1)
+        self.assertEqual(probe_calls["count"], 4)
+
+    def test_unknown_port_state_during_startup_is_logged(self):
+        clock = FakeClock()
+        spawner = RepeatingSpawner(clock, exit_after=None)
+        notifier = RecordingNotifier()
+        holder = {}
+
+        def probe():
+            return False
+
+        def port_open():
+            raise RuntimeError("port check failed")
+
+        def on_sleep(_seconds):
+            if len(clock.sleeps) >= 2:
+                holder["supervisor"].stop()
+
+        clock.on_sleep = on_sleep
+        supervisor = self._supervisor(
+            spawner,
+            probe,
+            clock,
+            notifier=notifier,
+            port_open=port_open,
+            failures=1,
+            startup_grace=300.0,
+            max_restarts=0,
+        )
+        holder["supervisor"] = supervisor
+
+        with self.assertLogs("kgcomfy", level="WARNING") as logs:
+            result = supervisor.run()
+
+        self.assertEqual(result, 0)
+        self.assertTrue(
+            any("TCP port state is unknown" in line for line in logs.output)
+        )
+
+    def test_port_probe_error_does_not_count_as_failure(self):
+        clock = FakeClock()
+        spawner = RepeatingSpawner(clock, exit_after=None)
+        calls = {"count": 0}
+
+        def probe():
+            calls["count"] += 1
+            return calls["count"] == 1
+
+        def port_open():
+            raise RuntimeError("port check failed")
+
+        notifier = RecordingNotifier()
+        holder = {}
+
+        def on_sleep(_seconds):
+            if len(clock.sleeps) >= 3:
+                holder["supervisor"].stop()
+
+        clock.on_sleep = on_sleep
+        supervisor = self._supervisor(
+            spawner,
+            probe,
+            clock,
+            notifier=notifier,
+            port_open=port_open,
+            failures=1,
+            max_restarts=0,
+        )
+        holder["supervisor"] = supervisor
+
+        result = supervisor.run()
+
+        self.assertEqual(result, 0)
+        self.assertNotIn("crashed", notifier.names)
+        self.assertNotIn("failed", notifier.names)
+        self.assertEqual(supervisor.status()["state"], "stopped")
+
+    def test_open_port_resets_previous_health_failures(self):
+        clock = FakeClock()
+        spawner = RepeatingSpawner(clock, exit_after=None)
+        probe_calls = {"count": 0}
+        port_states = iter([False, True, False, False])
+
+        def probe():
+            probe_calls["count"] += 1
+            return probe_calls["count"] == 1
+
+        supervisor = self._supervisor(
+            spawner,
+            probe,
+            clock,
+            port_open=lambda: next(port_states, False),
+            failures=2,
+            max_restarts=0,
+        )
+
+        result = supervisor.run()
+
+        self.assertEqual(result, 1)
+        self.assertEqual(probe_calls["count"], 5)
+
+    def test_manual_stop_notifies_stopped(self):
+        clock = FakeClock()
+        spawner = RepeatingSpawner(clock, exit_after=None)
+        notifier = RecordingNotifier()
+        holder = {}
+
+        def on_sleep(_seconds):
+            if len(clock.sleeps) >= 2:
+                holder["supervisor"].stop()
+
+        clock.on_sleep = on_sleep
+        supervisor = self._supervisor(
+            spawner,
+            lambda: True,
+            clock,
+            notifier=notifier,
+            max_restarts=5,
+        )
+        holder["supervisor"] = supervisor
+
+        result = supervisor.run()
+
+        self.assertEqual(result, 0)
+        self.assertEqual(notifier.names[-1], "stopped")
+        self.assertEqual(
+            notifier.events[-1][2]["reason"], "收到停止请求"
+        )
+
+    def test_notifier_exception_does_not_break_supervisor(self):
+        clock = FakeClock()
+        spawner = RepeatingSpawner(clock, exit_after=1.0)
+        supervisor = self._supervisor(
+            spawner,
+            lambda: True,
+            clock,
+            notifier=BoomNotifier(),
+            max_restarts=0,
+        )
+
+        result = supervisor.run()
+
+        self.assertEqual(result, 1)
+        self.assertEqual(supervisor.status()["state"], "failed")
+
 
 class SpawnerTests(unittest.TestCase):
     def test_child_output_is_written_to_log(self):
@@ -437,6 +992,38 @@ class _HealthHandler(BaseHTTPRequestHandler):
 
     def log_message(self, *args):
         pass
+
+
+class PortProbeTests(unittest.TestCase):
+    def test_probe_tracks_listener_state(self):
+        with socket.socket() as server:
+            server.bind(("127.0.0.1", 0))
+            server.listen(1)
+            port = server.getsockname()[1]
+            self.assertTrue(TcpPortProbe("127.0.0.1", port, timeout=0.5)())
+
+        self.assertFalse(TcpPortProbe("127.0.0.1", port, timeout=0.2)())
+
+    def test_probe_returns_none_on_timeout(self):
+        with mock.patch(
+            "kgcomfy.supervisor.socket.create_connection",
+            side_effect=TimeoutError,
+        ):
+            self.assertIsNone(TcpPortProbe("127.0.0.1", 1)())
+
+    def test_probe_returns_false_on_refused(self):
+        with mock.patch(
+            "kgcomfy.supervisor.socket.create_connection",
+            side_effect=ConnectionRefusedError,
+        ):
+            self.assertIs(TcpPortProbe("127.0.0.1", 1)(), False)
+
+    def test_probe_returns_none_on_other_oserror(self):
+        with mock.patch(
+            "kgcomfy.supervisor.socket.create_connection",
+            side_effect=OSError("boom"),
+        ):
+            self.assertIsNone(TcpPortProbe("127.0.0.1", 1)())
 
 
 class HealthProbeTests(unittest.TestCase):

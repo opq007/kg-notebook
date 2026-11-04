@@ -14,6 +14,7 @@ import logging
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import threading
 import time
@@ -36,7 +37,12 @@ from typing import (
 )
 
 from .config import WatchdogConfig
-from .shell import merge_env
+from .shell import describe_exception, merge_env
+from .webhook import (
+    Notifier,
+    flush_notifications,
+    send_notification,
+)
 
 log = logging.getLogger("kgcomfy")
 
@@ -78,6 +84,17 @@ class SupervisorStatus(TypedDict, total=False):
 class WatchOutcome(NamedTuple):
     exit_code: int | None
     reason: str = ""
+
+
+def _format_duration(seconds: float) -> str:
+    total = max(0, int(seconds))
+    if total < 60:
+        return f"{total}s"
+    minutes, secs = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes}m{secs}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes}m{secs}s"
 
 
 def rotate_log_if_needed(
@@ -211,6 +228,33 @@ class SubprocessSpawner:
         return SubprocessHandle(process)
 
 
+class TcpPortProbe:
+    """Return True while something still accepts TCP connections on the port.
+
+    A listening socket is owned by the kernel, so it stays connectable even
+    when the application cannot serve HTTP (long task, GIL starvation).  The
+    watchdog uses this as a safety net: a failed HTTP probe with a live port is
+    treated as "busy", not "hung".
+    """
+
+    def __init__(self, host: str, port: int, timeout: float = 1.0):
+        self.host = host
+        self.port = int(port)
+        self.timeout = timeout
+
+    def __call__(self) -> bool | None:
+        try:
+            with socket.create_connection(
+                (self.host, self.port), timeout=self.timeout
+            ):
+                return True
+        except ConnectionRefusedError:
+            return False
+        except OSError:
+            # Timeouts/resets/route errors are unknown, not "closed".
+            return None
+
+
 class HttpHealthProbe:
     """Return True when ComfyUI answers the configured path with 2xx."""
 
@@ -263,6 +307,8 @@ class Supervisor:
         now: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] | None = None,
         wall_clock: Callable[[], float] = time.time,
+        notifier: Notifier | None = None,
+        port_open: Callable[[], bool | None] | None = None,
     ):
         self.name = name
         self.settings = settings
@@ -272,6 +318,8 @@ class Supervisor:
         self._now = now
         self._sleep = sleep
         self._wall_clock = wall_clock
+        self._notifier = notifier
+        self._port_open = port_open
 
         self._stop = threading.Event()
         self._current: ProcessHandle | None = None
@@ -315,18 +363,30 @@ class Supervisor:
         except KeyboardInterrupt:
             self._log.warning("Interrupted; stopping %s", self.name)
             self.stop()
+            self._notify(
+                "stopped",
+                f"{self.name} 已停止",
+                {"reason": "用户中断"},
+            )
             result = EXIT_INTERRUPTED
         except Exception as exc:  # keep the notebook cell alive and leave a trace
             self._log.exception("Watchdog for %s crashed", self.name)
+            error = describe_exception(exc)
             self._update_inactive(
                 SupervisorState.FAILED,
-                last_error=f"{type(exc).__name__}: {exc}",
+                last_error=error,
+            )
+            self._notify(
+                "failed",
+                f"{self.name} 看门狗异常退出",
+                {"error": error},
             )
             result = EXIT_GAVE_UP
         finally:
             self._terminate_current()
             if result in (EXIT_CLEAN, EXIT_INTERRUPTED):
                 self._update_inactive(SupervisorState.STOPPED)
+            self._flush_notifier()
         return result
 
     def stop(self) -> None:
@@ -336,6 +396,10 @@ class Supervisor:
 
     def status(self) -> SupervisorStatus:
         return cast(SupervisorStatus, dict(self._state))
+
+    @property
+    def notifier(self) -> Notifier | None:
+        return self._notifier
 
     @classmethod
     def load_state(cls, path_text: str) -> SupervisorStatus:
@@ -355,25 +419,37 @@ class Supervisor:
         settings = self.settings
         restarts: deque[float] = deque()
         completed_restarts = 0
-        spawned = False
+        has_started_process = False
 
         while not self._stop.is_set():
             started = self._now()
             handle: ProcessHandle | None = None
             exit_code: int | None = None
             last_error = ""
+            spawn_failed = False
 
             try:
                 handle = self._spawn()
             except Exception as exc:
-                last_error = f"{type(exc).__name__}: {exc}"
+                spawn_failed = True
+                last_error = describe_exception(exc)
                 self._log.error("Failed to start %s: %s", self.name, last_error)
                 exit_code = -1
+                if not self._stop.is_set():
+                    self._notify(
+                        "start_failed",
+                        f"{self.name} 启动失败",
+                        {
+                            "error": last_error,
+                            "restarts": completed_restarts,
+                        },
+                    )
             else:
                 self._current = handle
-                if spawned:
+                first_process = not has_started_process
+                if not first_process:
                     completed_restarts += 1
-                spawned = True
+                has_started_process = True
                 self._update_state(
                     SupervisorState.RUNNING,
                     pid=handle.pid,
@@ -384,10 +460,19 @@ class Supervisor:
                     next_restart_in=None,
                 )
                 self._log.info("%s started (pid %s)", self.name, handle.pid)
+                if first_process:
+                    self._notify(
+                        "started",
+                        f"{self.name} 已启动",
+                        {
+                            "pid": handle.pid,
+                            "restarts": completed_restarts,
+                        },
+                    )
 
             reason = ""
             if handle is not None:
-                outcome = self._watch(handle, started)
+                outcome = self._watch(handle, started, completed_restarts)
                 exit_code = outcome.exit_code
                 reason = outcome.reason
 
@@ -409,6 +494,14 @@ class Supervisor:
                     last_exit_code=exit_code,
                     last_error="",
                 )
+                self._notify(
+                    "stopped",
+                    f"{self.name} 已正常退出",
+                    {
+                        "exit_code": exit_code,
+                        "restarts": completed_restarts,
+                    },
+                )
                 return EXIT_CLEAN
 
             if reason and not last_error:
@@ -420,9 +513,24 @@ class Supervisor:
                 exit_code,
                 uptime,
             )
-            self._log_tail()
+            tail = self._tail_lines(None)
+            self._log_tail(tail[-_TAIL_LINES:])
             # Clear orphaned children (custom nodes) before the next start.
             self._terminate_current()
+
+            if not spawn_failed:
+                self._notify(
+                    "crashed",
+                    f"{self.name} 意外停止",
+                    {
+                        "exit_code": exit_code,
+                        "uptime": _format_duration(uptime),
+                        "reason": reason or "进程异常退出",
+                        "restarts": completed_restarts,
+                        "log_path": settings.log_path,
+                        "log_tail": tail,
+                    },
+                )
 
             # A run that survived a full window starts a fresh restart budget.
             if uptime >= settings.restart_window:
@@ -445,6 +553,20 @@ class Supervisor:
                     last_exit_code=exit_code,
                     last_error=message,
                 )
+                self._notify(
+                    "failed",
+                    f"{self.name} 重启失败，看门狗已停止",
+                    {
+                        "exit_code": exit_code,
+                        "restarts": completed_restarts,
+                        "restart_attempts": len(restarts),
+                        "max_restarts": settings.max_restarts,
+                        "restart_window": settings.restart_window,
+                        "last_error": last_error,
+                        "log_path": settings.log_path,
+                        "log_tail": tail,
+                    },
+                )
                 return EXIT_GAVE_UP
 
             restarts.append(now)
@@ -460,16 +582,38 @@ class Supervisor:
                 last_error=last_error,
                 next_restart_in=delay,
             )
+            self._notify(
+                "restarting",
+                f"{self.name} 将在 {delay:g}s 后重启",
+                {
+                    "delay": f"{delay:g}s",
+                    "attempt": len(restarts),
+                    "max_restarts": settings.max_restarts,
+                    "exit_code": exit_code,
+                    "reason": last_error,
+                },
+            )
             self._pause(delay)
 
+        self._notify(
+            "stopped",
+            f"{self.name} 已停止",
+            {"reason": "收到停止请求", "restarts": completed_restarts},
+        )
         return EXIT_CLEAN
 
-    def _watch(self, handle: ProcessHandle, started: float) -> WatchOutcome:
+    def _watch(
+        self, handle: ProcessHandle, started: float, completed_restarts: int = 0
+    ) -> WatchOutcome:
         """Poll the process and health endpoint until exit or restart."""
         settings = self.settings
         healthy = False
         ever_healthy = False
         health_failures = 0
+        announced_ready = False
+        announced_restarted = False
+        busy_logged = False
+        unknown_logged = False
 
         while not self._stop.is_set():
             code = handle.poll()
@@ -487,29 +631,103 @@ class Supervisor:
                     self._update_state(
                         SupervisorState.RUNNING, pid=handle.pid, healthy=True
                     )
+                    if not announced_ready:
+                        self._notify(
+                            "ready",
+                            f"{self.name} 服务已就绪",
+                            {
+                                "pid": handle.pid,
+                                "startup_seconds": round(elapsed, 1),
+                                "restarts": completed_restarts,
+                            },
+                        )
+                        announced_ready = True
+                    if completed_restarts > 0 and not announced_restarted:
+                        self._notify_restarted(
+                            handle, elapsed, completed_restarts
+                        )
+                        announced_restarted = True
                 healthy = True
                 ever_healthy = True
                 health_failures = 0
-            elif ever_healthy or elapsed >= settings.startup_grace:
+                busy_logged = False
+                unknown_logged = False
+            else:
                 if healthy:
                     self._update_state(
                         SupervisorState.RUNNING, pid=handle.pid, healthy=False
                     )
                     healthy = False
-                health_failures += 1
-                self._log.warning(
-                    "%s health check failed (%d/%d)",
-                    self.name,
-                    health_failures,
-                    settings.failures,
-                )
-                if health_failures >= settings.failures:
-                    self._log.error("%s is unresponsive; restarting", self.name)
-                    self._terminate_current()
-                    code = handle.poll()
-                    if code is None:
-                        code = -9
-                    return WatchOutcome(code, "health check failed")
+
+                port_open: bool | None = False
+                if self._port_open is not None:
+                    try:
+                        result = self._port_open()
+                        port_open = (
+                            None if result is None else bool(result)
+                        )
+                    except Exception:
+                        self._log.debug(
+                            "TCP port check for %s failed",
+                            self.name,
+                            exc_info=True,
+                        )
+                        port_open = None
+
+                if port_open is True:
+                    # The process still owns its listening socket: it is
+                    # probably busy with a long task, not hung.  This applies
+                    # during startup too, so a restarted but busy process still
+                    # gets one "restarted" notification.
+                    if not busy_logged:
+                        self._log.warning(
+                            "%s health check timed out but its port is still "
+                            "listening; treating it as busy",
+                            self.name,
+                        )
+                        busy_logged = True
+                    unknown_logged = False
+                    health_failures = 0
+                    if completed_restarts > 0 and not announced_restarted:
+                        self._notify_restarted(
+                            handle,
+                            elapsed,
+                            completed_restarts,
+                            "health check timed out; port is listening",
+                        )
+                        announced_restarted = True
+                else:
+                    if port_open is None:
+                        if not unknown_logged:
+                            self._log.warning(
+                                "%s health check failed and TCP port state is "
+                                "unknown; not counting toward restart",
+                                self.name,
+                            )
+                            unknown_logged = True
+                        busy_logged = False
+                    else:
+                        busy_logged = False
+                        unknown_logged = False
+                        if ever_healthy or elapsed >= settings.startup_grace:
+                            health_failures += 1
+                            self._log.warning(
+                                "%s health check failed (%d/%d)",
+                                self.name,
+                                health_failures,
+                                settings.failures,
+                            )
+                            if health_failures >= settings.failures:
+                                self._log.error(
+                                    "%s is unresponsive; restarting", self.name
+                                )
+                                self._terminate_current()
+                                code = handle.poll()
+                                if code is None:
+                                    code = -9
+                                return WatchOutcome(
+                                    code, "health check failed"
+                                )
 
             self._pause(settings.interval)
 
@@ -533,6 +751,35 @@ class Supervisor:
             handle.terminate(timeout=self.settings.shutdown_timeout)
         except Exception:
             self._log.exception("Failed to terminate %s", self.name)
+
+    def _notify_restarted(
+        self,
+        handle: ProcessHandle,
+        elapsed: float,
+        completed_restarts: int,
+        reason: str = "",
+    ) -> None:
+        details: Dict[str, Any] = {
+            "pid": handle.pid,
+            "startup_seconds": round(elapsed, 1),
+            "restarts": completed_restarts,
+        }
+        if reason:
+            details["reason"] = reason
+        self._notify("restarted", f"{self.name} 已重启", details)
+
+    def _notify(
+        self,
+        event: str,
+        summary: str,
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
+        send_notification(
+            self._notifier, self._log, event, summary, details
+        )
+
+    def _flush_notifier(self) -> None:
+        flush_notifications(self._notifier, self._log)
 
     def _update_inactive(
         self, status: SupervisorState, **fields: Any
@@ -568,12 +815,12 @@ class Supervisor:
                 self._log.warning("Cannot write watchdog state %s: %s", path, exc)
                 self._state_warned = True
 
-    def _log_tail(self) -> None:
+    def _tail_lines(self, limit: int | None = _TAIL_LINES) -> list[str]:
         if not self.settings.log_path:
-            return
+            return []
         path = Path(self.settings.log_path)
         if not path.is_file():
-            return
+            return []
         try:
             with path.open("rb") as handle:
                 handle.seek(0, os.SEEK_END)
@@ -582,13 +829,17 @@ class Supervisor:
                 text = handle.read().decode("utf-8", "replace")
         except OSError as exc:
             self._log.warning("Cannot read log tail %s: %s", path, exc)
-            return
+            return []
+        lines = text.splitlines()
+        return lines if limit is None else lines[-limit:]
 
-        lines = text.splitlines()[-_TAIL_LINES:]
+    def _log_tail(self, lines: list[str] | None = None) -> None:
+        if lines is None:
+            lines = self._tail_lines(_TAIL_LINES)
         if lines:
             self._log.error(
                 "Last %d lines of %s:\n%s",
                 len(lines),
-                path,
+                self.settings.log_path,
                 "\n".join(lines),
             )

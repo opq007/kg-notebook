@@ -23,6 +23,11 @@ def merge_env(env: Mapping[str, Any] | None = None) -> Dict[str, str]:
     return merged
 
 
+def describe_exception(exc: BaseException) -> str:
+    """Return ``Type: message`` for logs and notifications."""
+    return f"{type(exc).__name__}: {exc}"
+
+
 class CommandError(RuntimeError):
     """Raised when a command exits with a non-zero status."""
 

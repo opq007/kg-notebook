@@ -30,6 +30,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--config", default="tts-img.yaml")
     run.add_argument("--dry-run", action="store_true")
 
+    webhook = subparsers.add_parser(
+        "test-webhook", help="send a test webhook notification"
+    )
+    webhook.add_argument("--config", default="tts-img.yaml")
+
     return parser
 
 
@@ -42,7 +47,13 @@ def main(argv: list[str] | None = None) -> int:
         config.validate()
 
         if args.command == "show-config":
-            print(json.dumps(config.to_dict(), indent=2, ensure_ascii=False))
+            print(
+                json.dumps(
+                    config.to_redacted_dict(),
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            )
             return 0
 
         app = KaggleComfy(config)
@@ -50,6 +61,15 @@ def main(argv: list[str] | None = None) -> int:
             app.prepare()
         elif args.command == "run":
             return app.run()
+        elif args.command == "test-webhook":
+            if app.test_webhook():
+                print("test notification sent")
+                return 0
+            print(
+                "webhook disabled, not configured, or send failed",
+                file=sys.stderr,
+            )
+            return 1
         return 0
     except (ConfigError, FileNotFoundError) as exc:
         print(f"error: {exc}", file=sys.stderr)

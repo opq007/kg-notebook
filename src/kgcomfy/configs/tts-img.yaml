@@ -107,7 +107,9 @@ watchdog:
   interval: 60
   # 单次 HTTP 健康检查超时（秒）
   timeout: 5
-  # 启动宽限期结束后，连续失败多少次触发重启
+  # HTTP 检查失败后还会探测 ComfyUI 端口：端口仍在监听时视为忙碌
+  # （例如长视频任务/GIL 阻塞），不累计失败、不重启；
+  # 只有进程退出或端口关闭时，才按 failures 的次数重启。
   failures: 3
   # 启动宽限期（秒）：模型加载期间健康检查失败不计数
   startup_grace: 300
@@ -124,6 +126,36 @@ watchdog:
   state_path: /kaggle/working/comfyui-watchdog.json
   # 日志超过该大小后轮转为 .1（0 表示不轮转）
   log_max_bytes: 52428800
+
+# Webhook 通知：ComfyUI 启动 / 意外停止 / 重启成功 / 重启失败等事件。
+# 支持飞书、钉钉（含加签）、企业微信、Slack 和通用 JSON。
+# URL 里通常带 token，建议用环境变量 KGCOMFY_WEBHOOK_URL 或 Kaggle Secrets 注入。
+webhook:
+  enabled: false
+  # auto 会按 URL 自动识别；也可显式指定 feishu / dingtalk / wecom / slack / generic
+  provider: auto
+  url: ""
+  # 飞书/钉钉加签密钥（可选）
+  secret: ""
+  # 也可以从 Kaggle Secrets / 环境变量读取（逻辑名对应 secrets 配置或环境变量大写名）
+  # url_secret: webhook_url
+  # sign_secret: webhook_secret
+  timeout: 5
+  # 消息标题前缀；钉钉开启“自定义关键词”时可把关键词放在这里
+  title: ComfyUI
+  # 留空表示全部事件；默认：
+  # started(启动) crashed(意外停止) start_failed(启动/重启命令失败)
+  # restarted(重启后健康检查通过) failed(达到重启上限，看门狗停止)
+  # 可选：ready(每代健康检查通过) restarting(准备重启) stopped(正常停止)
+  events:
+    - started
+    - crashed
+    - start_failed
+    - restarted
+    - failed
+  # 意外停止时附带 ComfyUI 日志尾部
+  include_log_tail: false
+  log_tail_lines: 10
 
 frp:
   enabled: true
